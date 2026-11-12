@@ -1,0 +1,8 @@
+# dsh-geobulk bundle patch
+# 一个 Host 插件（/geobulk HTTP 路由 + geobulk agent 工具 + prompt section）
+# 加一个 Client 整页（main 槽 key=geobulk，侧边栏 panellist 入口）。
+# id 与 name 必须等于包名 dsh-geobulk：Client 模块 loader id 要与包名一致。
+- insert:
+    - id: dsh-geobulk
+      name: 'dsh-geobulk'
+      config: {}

@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  syntax-and-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Python 依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy scikit-learn matplotlib anndata h5py lifelines statsmodels openpyxl pillow networkx
+
+      - name: Python 语法检查
+        run: for f in lib/*.py; do python -m py_compile "$f"; done
+
+      - name: Node/JS 语法检查
+        run: |
+          node --check index.js
+          node --check client.js
+          node --check lib/impl.mjs
+          node --check lib/engine.mjs
+
+      - name: Client 纯函数单测
+        run: node test/client-logic.test.mjs
+
+      - name: Client 组件渲染烟测
+        run: node test/client-render.test.mjs
+
+      - name: Host 层联调（假 ctx，启动 Python worker）
+        run: node test/host_ops.test.mjs
+
+      - name: GEO 解析单测（离线 mock）
+        run: python test/py_geo_test.py
+
+      - name: 单细胞映射单测
+        run: python test/py_scmap_test.py

@@ -1,0 +1,77 @@
+{
+  "name": "dsh-geobulk",
+  "version": "0.1.0",
+  "description": "GEO / Bulk 转录组工作台（DeepSeek Harness 插件）：GEO 检索下载、自有测序矩阵导入与清洗、差异表达、功能富集、免疫浸润、临床生存与高级预后、单细胞映射、circRNA/miRNA/lncRNA/fusion/可变剪接。",
+  "license": "MIT",
+  "author": "jszjdyt",
+  "homepage": "https://github.com/jszjdyt/dsh-geobulk#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jszjdyt/dsh-geobulk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jszjdyt/dsh-geobulk/issues"
+  },
+  "icon": "icon.svg",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "lib/*.mjs",
+    "lib/*.py",
+    "lib/*.R",
+    "lib/*.txt",
+    "examples/",
+    "README.md",
+    "DESIGN.md",
+    "INSTALL.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "requirements.txt"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "geo",
+    "bulk-rnaseq",
+    "transcriptomics",
+    "differential-expression",
+    "gene-set-enrichment",
+    "immune-infiltration",
+    "survival-analysis",
+    "prognosis",
+    "single-cell-mapping",
+    "circrna",
+    "mirna",
+    "lncrna",
+    "fusion-gene",
+    "alternative-splicing"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -6,7 +6,7 @@
 
 一个装在 **DeepSeek Harness** 里的 GEO / Bulk 转录组分析工作台：在浏览器里检索下载 GEO 表达谱、导入自己的测序矩阵、跑清洗与差异分析、做免疫浸润/生存/预后、把分子签名映射到单细胞亚群，并分析 circRNA / miRNA / lncRNA / fusion / 可变剪接。
 
-界面形态与操作逻辑与姊妹项目 [`dsh-singlecell`](https://github.com/jszjdyt/dsh-singlecell)（单细胞工作台）一致：**左栏流程卡 → 中间图表 → 右栏 Agent 面板**；页面上的每个按钮和对话里的 `geobulk` 工具调用**走同一套实现**，所以「点着用」和「让 Agent 干活」结果完全一致。
+界面形态与操作逻辑与姊妹项目 [`dsh-singlecell`](https://github.com/jszjdyt/singlecell-full-workflow)（单细胞工作台）一致：**左栏流程卡 → 中间图表 → 右栏 Agent 面板**；页面上的每个按钮和对话里的 `geobulk` 工具调用**走同一套实现**，所以「点着用」和「让 Agent 干活」结果完全一致。
 
 > **English TL;DR** — A DeepSeek Harness plugin that puts a GEO/bulk transcriptomics workbench inside the chat UI: search & download GEO series, import your own count/TPM matrices with sample/clinical sheets, clean (QC → filter → normalize → batch correction → PCA), run limma/DESeq2 differential expression, GO/KEGG/Hallmark enrichment, IOBR immune deconvolution, Kaplan-Meier/Cox survival, prognostic risk models, project bulk signatures onto a single-cell reference (including pulling the active dataset straight from `dsh-singlecell`), and analyse circRNA/miRNA/lncRNA/fusion/alternative-splicing tables. Python engine + optional R bridge; everything degrades gracefully when R or the network is missing.
 
@@ -177,7 +177,7 @@ CI 在 GitHub Actions 上跑语法检查 + 不依赖 R 的单测（见 `.github/
 
 ## 关系与致谢
 
-- 姊妹项目：[`dsh-singlecell`](https://github.com/jszjdyt/dsh-singlecell)（单细胞工作台），本插件的 UI 形态、宿主集成方式与工程约定与其一致，并可与之联动。
+- 姊妹项目：[`dsh-singlecell`](https://github.com/jszjdyt/singlecell-full-workflow)（单细胞工作台），本插件的 UI 形态、宿主集成方式与工程约定与其一致，并可与之联动。
 - 方法学依赖：limma、DESeq2、clusterProfiler、fgsea、GSVA、WGCNA、timeROC、rms、glmnet、survminer、**IOBR**（免疫浸润）、lifelines、scikit-learn、matplotlib。
 - 干运行环境：DeepSeek Harness（Host 插件体系）。
 

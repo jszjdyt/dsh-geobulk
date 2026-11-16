@@ -25,3 +25,6 @@ downloads/
 test/tmp/
 test/output/
 .pytest_cache/
+
+# Release 产物（由 npm pack 生成，不入库）
+*.tgz

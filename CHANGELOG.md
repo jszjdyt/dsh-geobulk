@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1 (2026-11-16)
+
+- 修复 README 里姊妹项目链接（`dsh-singlecell` → `singlecell-full-workflow`）
+- 新增 512×512 PNG 图标，用于插件目录（`dsh-plugin` 生态要求位图）
+- 新增 `LAUNCH.md` 发布文案与 `dsh-geobulk-0.1.1.tgz` npm 包形态的 Release 资产
+- README 增加「从 Release tarball 安装」方式（插件市场同款）
+
 ## 0.1.0 (2026-11-12)
 
 首个公开版本。

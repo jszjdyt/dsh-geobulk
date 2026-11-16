@@ -71,6 +71,14 @@ cd dsh-geobulk
 plugin_manager  action=install_bundle  target=<克隆目录的绝对路径>
 ```
 
+也可以直接用 Release 里的 npm 包安装（插件市场同款，无需克隆）：
+
+```text
+plugin_manager  action=install_bundle  target=https://github.com/jszjdyt/dsh-geobulk/releases/download/v0.1.1/dsh-geobulk-0.1.1.tgz
+```
+
+> npm 上的 `dsh-geobulk` 尚未发布（`npm login` 后 `npm publish` 即可）；`dsh-singlecell` 这个 npm 名字已被他人占用，单细胞插件发布时需用 `dsh-singlecell-workbench`。
+
 安装完成后**刷新一次页面**：左侧边栏出现「Bulk 工作台」，对话里出现 `geobulk` 工具。
 
 > 这是 Host + Client 双半页插件：Host 提供 `/geobulk/*` 路由与 `geobulk` 工具，Client 注册整页与侧边栏入口。安装细节见 [INSTALL.md](INSTALL.md)。

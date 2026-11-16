@@ -303,6 +303,10 @@ def run_r(script_name: str, payload: dict, outdir: str, timeout: int = 900) -> d
     if res.returncode == 3:
         reason = stderr_tail.strip().splitlines()[-1] if stderr_tail.strip() else "R 侧数据不满足前置条件"
         raise EngineError("prerequisite", reason)
+    if res.returncode == 4:
+        # 运行期程序错误：调用方不得据此改换统计方法（GEO-02）
+        message = stderr_tail.strip() or "R 脚本运行期错误"
+        raise EngineError("runtime", f"R 计算内部错误：{message[-800:]}")
     if res.returncode != 0:
         message = stderr_tail.strip() or stdout_tail.strip() or f"Rscript 退出码 {res.returncode}"
         raise EngineError("internal", f"R 计算失败：{message[-800:]}")
@@ -346,6 +350,8 @@ def try_run_r(script_name: str, payload: dict, outdir: str, timeout: int = 900) 
     try:
         return run_r(script_name, payload, outdir, timeout=timeout)
     except EngineError as error:
-        if error.code == "prerequisite":
+        # prerequisite（数据/依赖不满足）与 runtime（程序错误）都必须上抛：
+        # 前者要让用户看到真实原因，后者绝不能被静默换成另一种统计方法（GEO-02）
+        if error.code in ("prerequisite", "runtime"):
             raise
         return {"__failed__": True, "error": error.message, "code": error.code}

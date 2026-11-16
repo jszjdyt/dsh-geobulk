@@ -18,18 +18,24 @@ dsh-geobulk — GEO 检索 / 详情 / 下载（CONTRACT §2.2 / §7.2 / §8.1）
   * 中文：ZH_DICT ≥120 条（疾病/组织/药物/技术/物种/常用词），用于 title_zh 与 tags。
   * 下载：dest_dir 必须绝对路径且不是 `/`；单文件 8GB 上限；120s 超时；分块写盘 + 进度回调；
     overwrite=False 时已存在则跳过（ok=true, skipped=true）。
+  * 覆盖下载的原子性：先写 `<name>.part`，只有完整性校验通过（写入字节数 == Content-Length；
+    缺失 Content-Length 时按扩展名用 gzip/bz2/tar 可读性兜底）才 os.replace 原子替换；
+    失败/中断保留旧文件并清理 `.part`。仅支持失败重试（每次从头下载），不做断点续传。
 
 本文件只依赖标准库 + bg_common（EngineError）。禁止新增第三方依赖。
 """
 
 from __future__ import annotations
 
+import bz2
+import gzip
 import html
 import json
 import os
 import re
 import socket
 import ssl
+import tarfile
 import time
 import urllib.error
 import urllib.parse
@@ -60,6 +66,8 @@ MAX_DOWNLOAD_BYTES = 8 * 1024 ** 3      # 单文件下载上限 8GB
 MATRIX_HEAD_BYTES = 96 * 1024           # 系列矩阵头部只抓 96KB（压缩后），足够解析 header
 MATRIX_HEAD_TIMEOUT = 30                # 头部抓取的单请求超时（秒）
 DOWNLOAD_CHUNK = 512 * 1024
+PART_SUFFIX = ".part"                   # 覆盖下载的临时文件后缀（校验通过后原子替换）
+VALIDATE_GZIP_FULL_MAX = 512 * 1024 ** 2  # 无 Content-Length 时 gzip/bz2 全量解压校验上限
 SERIES_MATRIX_KIND = "series_matrix"
 
 _SPECIES_ALIAS = {
@@ -1232,33 +1240,105 @@ def _emit(progress, message: str, pct: float | None = None) -> None:
         pass
 
 
+class _DownloadIntegrityError(Exception):
+    """下载内容不完整（字节数不符 / 压缩容器打不开）：可重试，不删除旧文件。"""
+
+
+def _content_length(headers) -> int | None:
+    """解析 Content-Length；缺失或非法返回 None（0 视为合法长度）。"""
+    if headers is None:
+        return None
+    try:
+        text = str(headers.get("Content-Length") or "").strip()
+    except Exception:  # noqa: BLE001 - 假响应/异常 headers 都按缺失处理
+        return None
+    if not text:
+        return None
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _check_tar_members(archive: tarfile.TarFile, *, check_size: bool, path: str) -> None:
+    """遍历 tar 成员；check_size=True 时用成员偏移校验文件是否被截断。"""
+    members = archive.getmembers()
+    if not check_size or not members:
+        return
+    expected_end = max((int(item.offset_data) + int(item.size) for item in members), default=0)
+    actual = os.path.getsize(path)
+    if actual < expected_end:
+        raise _DownloadIntegrityError(
+            f"tar 数据被截断：实际 {actual} 字节 < 成员所需 {expected_end} 字节")
+
+
+def _validate_download(path: str, expected: int | None, target: str) -> None:
+    """下载完整性校验：优先核对 Content-Length；缺失时按扩展名做容器可读性兜底。"""
+    try:
+        size = os.path.getsize(path)
+    except OSError as error:
+        raise _DownloadIntegrityError(f"无法读取临时文件：{error}")
+    if expected is not None:
+        if size != expected:
+            raise _DownloadIntegrityError(
+                f"写入 {size} 字节，与 Content-Length={expected} 不一致（{os.path.basename(target)}）")
+        return
+    name = os.path.basename(target).lower()
+    try:
+        if name.endswith((".tar.gz", ".tgz")):
+            with tarfile.open(path, "r:gz") as archive:
+                _check_tar_members(archive, check_size=False, path=path)
+        elif name.endswith((".tar.bz2", ".tbz", ".tbz2")):
+            with tarfile.open(path, "r:bz2") as archive:
+                _check_tar_members(archive, check_size=False, path=path)
+        elif name.endswith(".tar"):
+            with tarfile.open(path, "r:") as archive:
+                _check_tar_members(archive, check_size=True, path=path)
+        elif name.endswith(".gz"):
+            if size <= VALIDATE_GZIP_FULL_MAX:
+                with gzip.open(path, "rb") as handle:
+                    while handle.read(DOWNLOAD_CHUNK):
+                        pass
+            else:
+                with gzip.open(path, "rb") as handle:
+                    handle.read(DOWNLOAD_CHUNK)  # 只验证 gzip 头/首个解压块可读
+        elif name.endswith(".bz2"):
+            if size <= VALIDATE_GZIP_FULL_MAX:
+                with bz2.open(path, "rb") as handle:
+                    while handle.read(DOWNLOAD_CHUNK):
+                        pass
+            else:
+                with bz2.open(path, "rb") as handle:
+                    handle.read(DOWNLOAD_CHUNK)
+    except (OSError, EOFError, tarfile.TarError, zlib.error) as error:
+        raise _DownloadIntegrityError(
+            f"{os.path.basename(target)} 无法通过容器可读性校验：{error}")
+
+
 def _download_one(url: str, target: str, *, progress=None, label: str = "") -> int:
-    """流式下载单个 URL 到 target（重试 ≤2 次）。返回写入字节数。"""
-    last_error = None
+    """流式下载单个 URL 到 target（失败重试 ≤2 次；仅支持失败重试，不支持断点续传）。
+
+    写入 `<target>.part`，完整性校验通过后才 os.replace 原子替换 target：
+      * 有 Content-Length 时必须严格相等；
+      * 缺失时按扩展名用 gzip/bz2/tar 可读性兜底。
+    任何失败/中断都会删除 `.part`，并且不触碰已存在的旧 target（旧文件保持原样）。
+    """
+    part = f"{target}{PART_SUFFIX}"
     attempts = len(RETRY_SLEEPS) + 1
+    last_error: Exception | None = None
     for attempt in range(attempts):
-        partial = f"{target}.part"
+        _remove_quiet(part)  # 每次重试都从头写（不支持断点续传）
+        written = 0
         try:
             with _urlopen(_request(url), HTTP_TIMEOUT) as response:
-                length_header = ""
-                headers = getattr(response, "headers", None)
-                if headers is not None:
-                    try:
-                        length_header = str(headers.get("Content-Length") or "")
-                    except Exception:  # noqa: BLE001
-                        length_header = ""
-                total = 0
-                try:
-                    total = int(length_header)
-                except (TypeError, ValueError):
-                    total = 0
-                if total > MAX_DOWNLOAD_BYTES:
+                total = _content_length(getattr(response, "headers", None))
+                if total is not None and total > MAX_DOWNLOAD_BYTES:
                     raise EngineError(
                         "unsupported",
                         f"文件过大（{total / 1024 ** 3:.1f} GB），超过单文件 8GB 下载上限：{label or url}",
                     )
-                written = 0
-                with open(partial, "wb") as handle:
+                with open(part, "wb") as handle:
                     while True:
                         chunk = response.read(DOWNLOAD_CHUNK)
                         if not chunk:
@@ -1274,19 +1354,30 @@ def _download_one(url: str, target: str, *, progress=None, label: str = "") -> i
                             pct = min(99.0, written / total * 100.0)
                             _emit(progress, f"下载 {label or url}：{written / 1024 ** 2:.1f}/"
                                             f"{total / 1024 ** 2:.1f} MB", pct)
-                os.replace(partial, target)
-                return written
+                    handle.flush()
+                    try:
+                        os.fsync(handle.fileno())
+                    except OSError:
+                        pass
+                _validate_download(part, total, target)
+            os.replace(part, target)
+            return written
         except EngineError:
-            _remove_quiet(f"{target}.part")
+            _remove_quiet(part)
             raise
+        except _DownloadIntegrityError as error:
+            last_error = error
+            _remove_quiet(part)
         except Exception as error:  # noqa: BLE001 - 网络/磁盘异常统一重试
             last_error = error
-            _remove_quiet(f"{target}.part")
-            _remove_quiet(target if attempt == 0 else "")
-            if attempt < attempts - 1:
-                delay = RETRY_SLEEPS[min(attempt, len(RETRY_SLEEPS) - 1)]
-                if delay > 0:
-                    time.sleep(delay)
+            _remove_quiet(part)
+        if attempt < attempts - 1:
+            delay = RETRY_SLEEPS[min(attempt, len(RETRY_SLEEPS) - 1)]
+            if delay > 0:
+                time.sleep(delay)
+    if isinstance(last_error, _DownloadIntegrityError):
+        raise EngineError("unsupported",
+                          f"下载校验失败：{last_error}（已重试 {attempts} 次，旧文件未改动）")
     raise _network_fail(last_error)
 
 
@@ -1301,7 +1392,11 @@ def _remove_quiet(path: str) -> None:
 
 
 def geo_download(gse, files, dest_dir, overwrite=False, progress=None) -> dict:
-    """把指定文件下载到 dest_dir（绝对路径、不可为 /），返回 {"dir","files","ms"}。"""
+    """把指定文件下载到 dest_dir（绝对路径、不可为 /），返回 {"dir","files","ms"}。
+
+    覆盖下载（overwrite=True）采用「.part 临时文件 + 完整性校验 + os.replace 原子替换」：
+    下载失败/中断时旧文件保持原样；不做断点续传，失败只从头重试。
+    """
     started = time.time()
     gse = _norm_gse(gse)
     dest = _check_dest_dir(dest_dir)
@@ -1377,8 +1472,8 @@ def geo_download(gse, files, dest_dir, overwrite=False, progress=None) -> dict:
                             "ok": True, "skipped": True})
             _emit(progress, f"已存在，跳过：{entry['name']}", min(100.0, base + 100.0 / total))
             continue
-        if overwrite:
-            _remove_quiet(target)
+        # 注意：overwrite=True 也不再先删除旧文件——由 _download_one 写 .part，
+        # 校验通过后原子替换；失败时旧文件必须保持可用。
         _emit(progress, f"正在下载 {entry['name']}（{index}/{total}）", base)
         try:
             written = _download_one(entry["url"], target, progress=progress, label=entry["name"])
@@ -1400,6 +1495,8 @@ def geo_download(gse, files, dest_dir, overwrite=False, progress=None) -> dict:
         "gse": gse,
         "files": results,
         "ms": int((time.time() - started) * 1000),
+        "resume": False,  # 仅支持失败重试，不支持断点续传
+        "notes": ["下载只支持失败重试（每次从头下载），不支持断点续传"],
     }
     if failed:
         result["warnings"] = [f"{failed} 个文件下载失败"]

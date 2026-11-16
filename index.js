@@ -7,17 +7,43 @@
  *   3. 注册一段 system prompt section，让 Agent 知道工作台与当前数据集；
  *   4. 插件卸载时关掉 Python worker。
  *
- * 业务逻辑都在 lib/impl.mjs / lib/engine.mjs 里，按 `?rev=` 动态 import，
- * 这样改完 lib 代码不用重启宿主进程（ESM 缓存绕开的做法见 dsh-paper-reader）。
+ * 业务逻辑都在 lib/impl.mjs / lib/engine.mjs 里。为了改完 lib 代码不用重启宿主进程，
+ * impl 用带 `?rev=<mtime>` 的 URL 动态 import；**同一个文件版本只 import 一次**，
+ * 否则每个 HTTP 请求都会新建一份模块实例，内存会随轮询持续增长（HOST-04）。
  */
+
+import { statSync } from 'node:fs'
 
 const PREFIX = '/geobulk'
 const VERSION = '0.1.0'
 
 /** 每次调用都拿一份新的 impl（带 rev 查询参数绕开 ESM 缓存）。 */
-async function loadImpl() {
-  const url = new URL(`./lib/impl.mjs?rev=${Date.now()}-${Math.random().toString(36).slice(2)}`, import.meta.url)
-  return import(url.href)
+const IMPL_URL = new URL('./lib/impl.mjs', import.meta.url)
+
+/** 当前 impl.mjs 的版本标识：文件没改就不换模块实例。 */
+function implVersion() {
+  try { return String(statSync(IMPL_URL).mtimeMs) } catch { return 'static' }
+}
+
+let implCache = { version: '', promise: null }
+
+/**
+ * 取 impl 模块：**按文件版本缓存**。
+ * 以前每次请求都生成 `?rev=Date.now()-随机`，等于每次请求都导入一份完整模块，
+ * 长期打开会持续占用内存（HOST-04：500 次导入即增长约 95 MiB）。
+ * 现在同一版本复用同一个 import Promise；开发时改了 impl.mjs，mtime 变化会自动换新模块。
+ */
+function loadImpl() {
+  const version = implVersion()
+  if (implCache.promise && implCache.version === version) return implCache.promise
+  const url = new URL(`?rev=${encodeURIComponent(version)}`, IMPL_URL)
+  const promise = import(url.href)
+  implCache = { version, promise }
+  promise.catch(() => {
+    // 导入失败不要把坏 Promise 缓存住
+    if (implCache.promise === promise) implCache = { version: '', promise: null }
+  })
+  return promise
 }
 
 export const name = 'dsh-geobulk'

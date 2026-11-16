@@ -113,6 +113,9 @@ VALID_CODES = {
     "timeout",
     "no_r",
     "no_python",
+    # R 脚本运行期程序错误：与 prerequisite（数据/依赖不满足）区分开，
+    # 上层的回退逻辑不允许因为它改换统计方法（GEO-02）
+    "runtime",
 }
 
 

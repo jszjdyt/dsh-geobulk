@@ -304,16 +304,24 @@ def run_filter(ctx, params, outdir):
 # ---------------------------------------------------------------------------
 
 def _quantile_normalize(X: np.ndarray) -> np.ndarray:
-    """分位数标准化（preprocessCore::normalize.quantiles 的等价实现）。"""
+    """分位数标准化（与 preprocessCore::normalize.quantiles 逐值一致，GEO-07）。
+
+    与官方实现的差别只在 ties 的处理：旧实现把参考分布按排序位置直接赋回，
+    同值（尤其大量 0）会被拆成不同值。这里按**平均秩**在参考分布上线性插值，
+    与 preprocessCore 的行为一致（同秩组得到同一个值）。
+    """
+    from scipy.stats import rankdata
+
     arr = np.array(X, dtype=np.float64)
-    if arr.shape[0] < 2:
+    n_rows, n_cols = arr.shape
+    if n_rows < 2 or n_cols == 0:
         return arr
-    sorted_idx = np.argsort(arr, axis=1)
-    sorted_arr = np.take_along_axis(arr, sorted_idx, axis=1)
-    reference = sorted_arr.mean(axis=0)
+    reference = np.sort(arr, axis=1).mean(axis=0)
+    positions = np.arange(n_cols, dtype=np.float64)
     out = np.empty_like(arr)
-    for i in range(arr.shape[0]):
-        out[i, sorted_idx[i]] = reference
+    for i in range(n_rows):
+        ranks = rankdata(arr[i], method="average")
+        out[i] = np.interp(ranks - 1.0, positions, reference)
     return out
 
 
@@ -347,11 +355,12 @@ def run_normalize(ctx, params, outdir):
     X = _X(ctx)
     X_orig = X.copy()
     method = str(params.get("method") or "auto").lower()
-    kind = str(ctx.get("X_kind") or "unknown")
+    kind = str(ctx.get("X_kind") or "unknown").lower()
     warnings: list[str] = []
     notes: list[str] = []
     log_transform = str(params.get("log_transform") or "auto").lower()
 
+    already_log = kind in ("lognorm", "log2", "logged")
     do_log = False
     if log_transform == "yes":
         do_log = True
@@ -359,12 +368,17 @@ def run_normalize(ctx, params, outdir):
         finite = X[np.isfinite(X)]
         integer_like = finite.size > 0 and bool(np.allclose(finite, np.round(finite)))
         do_log = bool(integer_like or (finite.size and finite.max() > 50))
-    if kind == "lognorm" and log_transform != "yes":
+    if already_log and log_transform != "yes":
         do_log = False
-        notes.append("矩阵看起来已经是 log 尺度（X_kind=lognorm），本次不再重复取对数")
+        notes.append("矩阵已经是 log 尺度（X_kind=lognorm），本次不再重复取对数")
 
     if method == "auto":
-        method = "cpm" if (do_log and kind == "counts") else ("quantile" if do_log else "median")
+        # GEO-07：已标准化的输入默认「不动」，而不是擅自再做一次中位数中心化
+        if already_log and log_transform != "yes":
+            method = "none"
+            notes.append("输入已是 log 尺度，auto 模式选择「不做标准化」（如需重算请显式指定 method）")
+        else:
+            method = "cpm" if (do_log and kind == "counts") else ("quantile" if do_log else "median")
 
     Xn = X.astype(np.float64)
     if method == "cpm":
@@ -382,7 +396,7 @@ def run_normalize(ctx, params, outdir):
         if do_log:
             Xn = np.log2(np.clip(Xn, 0, None) + 1.0)
         Xn = _quantile_normalize(Xn)
-        notes.append("分位数标准化" + ("（先 log2 转换）" if do_log else ""))
+        notes.append("分位数标准化（同秩取参考分布均值）" + ("（先 log2 转换）" if do_log else ""))
     elif method == "median":
         if do_log:
             Xn = np.log2(np.clip(Xn, 0, None) + 1.0)
@@ -397,6 +411,21 @@ def run_normalize(ctx, params, outdir):
     else:
         raise EngineError("bad_request", f"未知标准化方法：{method}")
 
+    # GEO-07：value_kind 必须描述**真实尺度**，不能一律写 lognorm
+    if method in ("cpm", "tmm"):
+        value_kind = "lognorm"   # 这两个分支内部固定做 log2
+    elif do_log or already_log:
+        value_kind = "lognorm"
+    else:
+        # method=none/median/quantile 且没有取对数、输入也不是 log 尺度：
+        # 矩阵仍是原始尺度，保持原类型
+        value_kind = kind if kind not in ("unknown", "") else "raw"
+        warnings.append(
+            f"本次没有取对数（method={method}，log_transform={log_transform}），"
+            f"矩阵仍是 {value_kind} 尺度；下游差异分析的 logFC 不是 log2 尺度，结论不能按 logFC 解读"
+        )
+        notes.append("未改变数据尺度：保持原始矩阵")
+
     X_out = np.asarray(Xn, dtype=np.float32)
     figures = [
         _dist_figure(X_orig, list(ctx["samples"]), outdir, "normalize_before.png", "Before normalization"),
@@ -406,16 +435,20 @@ def run_normalize(ctx, params, outdir):
     before_med = float(np.median([np.median(row[row > 0]) if (row > 0).any() else 0.0 for row in X_orig]))
     after_med = float(np.median([np.median(row[row > 0]) if (row > 0).any() else 0.0 for row in X_out]))
     bullets.append(f"样本中位表达：{before_med:.3g} → {after_med:.3g}")
+    bullets.append(f"矩阵尺度：{kind} → {value_kind}")
     payload = result(
         title="标准化",
         bullets=bullets,
         metrics={"method": method, "log_transformed": do_log,
+                 "value_kind_before": kind, "value_kind_after": value_kind,
+                 "scale_changed": bool(value_kind != kind),
                  "median_before": before_med, "median_after": after_med},
         figures=figures,
         warnings=warnings,
-        notes=notes + ["标准化后矩阵用于差异分析（logFC 为 log2 尺度）"],
+        notes=notes + ([f"标准化后矩阵用于差异分析（logFC 为 log2 尺度）"]
+                       if value_kind == "lognorm" else ["矩阵仍是原始尺度，差异分析会明确提示按数值特征判断尺度"]),
     )
-    payload["replace"] = {"X": X_out, "value_kind": "lognorm"}
+    payload["replace"] = {"X": X_out, "value_kind": value_kind}
     return payload
 
 

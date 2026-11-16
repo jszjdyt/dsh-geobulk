@@ -12,6 +12,8 @@ dsh-geobulk — 临床生存分析模块（步骤 survival + 生存类分析）
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pandas as pd
 
@@ -31,13 +33,75 @@ TIME_HINTS = ("os_time", "os.time", "time", "survival_time", "dfs_time", "rfs_ti
               "month", "months", "days", "follow")
 EVENT_HINTS = ("os_event", "event", "status", "dead", "death", "censor", "vital")
 
+# 事件编码词表（逐值匹配，不按整列判断——混合编码里 Dead/Alive/1/0/NA 可以同时出现）
+_EVENT_POSITIVE = {
+    "1", "1.0", "dead", "death", "deceased", "event", "yes", "y", "true", "t",
+    "progression", "progressed", "recurrence", "recurred", "relapse", "relapsed",
+    "died", "disease_death", "dead/deceased",
+}
+_EVENT_NEGATIVE = {
+    "0", "0.0", "alive", "living", "censor", "censored", "censoring", "no", "n",
+    "false", "f", "disease free", "diseasefree", "disease-free", "df", "no_event",
+    "not_recurred", "without recurrence",
+}
+
+
+def _parse_event_value(raw) -> float | None:
+    """单个事件值 → 1.0 / 0.0 / None（未知，必须排除而不是当删失）。
+
+    支持：0/1 数字、布尔、Dead/Alive 文本、TCGA 风格 ``0:LIVING`` / ``1:DECEASED``。
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return 1.0 if raw else 0.0
+    if isinstance(raw, (int, float, np.integer, np.floating)):
+        if pd.isna(raw):
+            return None
+        value = float(raw)
+        if value == 1.0:
+            return 1.0
+        if value == 0.0:
+            return 0.0
+        # 非 0/1 的数字：语义不明，不能猜
+        return None
+    text = str(raw).strip().lower()
+    if text in ("", "na", "nan", "none", "null", "unknown", "?", "-"):
+        return None
+    if text in _EVENT_POSITIVE:
+        return 1.0
+    if text in _EVENT_NEGATIVE:
+        return 0.0
+    # TCGA / 常见前缀编码：0:LIVING、1:DECEASED、0:alive、1:dead
+    match = re.match(r"^\s*([01])(?:\.0)?\s*(?:[:;：|/]|\s)\s*(.*)$", text)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+def _parse_event_series(series: pd.Series) -> tuple[pd.Series, list, int]:
+    """逐值清洗事件列。返回 (数值化事件列, 未知值样本列表, 未知值个数)。"""
+    parsed = [_parse_event_value(value) for value in series.tolist()]
+    events = pd.Series(
+        [np.nan if value is None else value for value in parsed],
+        index=series.index,
+        dtype=float,
+    )
+    unknown = [str(idx) for value, idx in zip(parsed, series.index) if value is None]
+    return events, unknown, len(unknown)
+
 
 # ---------------------------------------------------------------------------
 # 临床数据
 # ---------------------------------------------------------------------------
 
 def clinical(ctx, params: dict | None = None) -> dict:
-    """取出并校验生存时间/事件列，返回 {frame, time_col, event_col, time, event}。"""
+    """取出并校验生存时间/事件列，返回 {frame, time_col, event_col, time, event}。
+
+    GEO-04：事件列必须**逐值**清洗，并把清洗后的 time/event 写回 ``frame``，
+    让 KM / Cox / 预后 / ROC 全部读到同一份数据；未知或缺失的事件状态被排除并记录，
+    绝不当成删失（当删失会系统性低估风险）。
+    """
     params = params or {}
     info = ctx.get("sample_info")
     if info is None or len(info) == 0:
@@ -63,22 +127,58 @@ def clinical(ctx, params: dict | None = None) -> dict:
             "prerequisite",
             "样本信息里找不到生存时间或事件列（可识别 os_time/event 等命名）；请先在「样本」里 join 临床表，或用 params 指定 time_col/event_col",
         )
+    warnings: list[str] = []
     times = pd.to_numeric(frame[time_col], errors="coerce")
-    events = pd.to_numeric(frame[event_col], errors="coerce")
-    # 事件列可能是 "Dead"/"Alive" 之类的字符串
-    if events.isna().all():
-        text = frame[event_col].astype(str).str.lower().str.strip()
-        events = text.isin(["1", "1.0", "dead", "death", "event", "yes", "true", "deceased", "progression"]).astype(float)
-    keep = times.notna() & (times > 0)
-    frame = frame.loc[keep]
+    invalid_time = int((times.isna() | (times <= 0)).sum())
+    events, unknown_samples, n_unknown = _parse_event_series(frame[event_col])
+    if n_unknown:
+        warnings.append(
+            f"事件列「{event_col}」有 {n_unknown} 个无法识别的事件状态，已排除（未当作删失）："
+            f"{'、'.join(unknown_samples[:8])}"
+        )
+    keep = times.notna() & (times > 0) & events.notna()
+    if invalid_time:
+        warnings.append(f"有 {invalid_time} 个样本的生存时间缺失或 ≤0，已排除")
+    dropped = int((~keep).sum())
+    frame = frame.loc[keep].copy()
     times = times.loc[keep].astype(float)
-    events = events.loc[keep].fillna(0).astype(float)
+    events = events.loc[keep].astype(float)
+    # 把清洗后的值写回返回 frame：下游 KM/Cox/预后/ROC 共用同一份口径
+    frame[time_col] = times.values
+    frame[event_col] = events.values
+    frame["_time"] = times.values
+    frame["_event"] = events.values
     if len(frame) < 6:
         raise EngineError("prerequisite", f"有效生存样本只有 {len(frame)} 个，至少需要 6 个")
     n_events = int((events > 0).sum())
     if n_events < 3:
         raise EngineError("prerequisite", f"事件数只有 {n_events} 个，无法做生存分析（建议至少 5 个事件）")
-    return {"frame": frame, "time_col": time_col, "event_col": event_col, "time": times.values, "event": events.values}
+    return {
+        "frame": frame,
+        "time_col": time_col,
+        "event_col": event_col,
+        "time": times.values,
+        "event": events.values,
+        "warnings": warnings,
+        "dropped": dropped,
+        "n_events": n_events,
+        "n_censored": int(len(frame) - n_events),
+    }
+
+
+def _attach_cleaning(payload: dict, data: dict) -> dict:
+    """把临床数据清洗结果挂到分析结果上（GEO-04：KM/Cox/预后共用同一份口径）。"""
+    extra = list(data.get("warnings") or [])
+    if extra:
+        payload["warnings"] = extra + list(payload.get("warnings") or [])
+    metrics = payload.setdefault("metrics", {})
+    metrics.update({
+        "n_samples_used": int(len(data["frame"])),
+        "n_events": int(data.get("n_events") or 0),
+        "n_censored": int(data.get("n_censored") or 0),
+        "n_dropped": int(data.get("dropped") or 0),
+    })
+    return payload
 
 
 def align_values(ctx, values, index) -> np.ndarray:
@@ -470,10 +570,10 @@ def run_logrank_multi(ctx, params, outdir):
     ax.set_xlabel("Time")
     ax.set_ylabel("Survival probability")
     figure = save_fig(fig, outdir, "km_multi.png", "KM multi-group")
-    return result(title="多组生存比较", bullets=[f"log-rank P={float(result_test.p_value):.3g}（{len(frame)} 组）"],
+    return _attach_cleaning(result(title="多组生存比较", bullets=[f"log-rank P={float(result_test.p_value):.3g}（{len(frame)} 组）"],
                   metrics={"p_value": float(result_test.p_value), "n_groups": int(len(frame))},
                   tables=[table("km_groups", "各组样本与事件", list(frame.columns), frame)],
-                  figures=[figure])
+                  figures=[figure]), data)
 
 
 def run_cox_uni(ctx, params, outdir):
@@ -510,7 +610,7 @@ def run_cox_uni(ctx, params, outdir):
     out["p.adjust"] = bh_fdr(out["p"].values)
     out = out.sort_values("p").reset_index(drop=True)
     forest = _forest_plot(out, outdir, "Univariable Cox", "forest_uni.png")
-    return result(
+    return _attach_cleaning(result(
         title="单因素 Cox 森林图",
         bullets=[f"{len(out)} 个基因；最显著 {out.iloc[0]['gene']}（HR={out.iloc[0]['HR']:.2f}, p={out.iloc[0]['p']:.3g}）"],
         metrics={"n_genes": int(len(out))},
@@ -518,7 +618,7 @@ def run_cox_uni(ctx, params, outdir):
         figures=[forest] if forest else [],
         warnings=warnings,
         notes=["协变量未校正的单因素 Cox"],
-    )
+    ), data)
 
 
 def run_cox_multi(ctx, params, outdir):
@@ -537,14 +637,14 @@ def run_cox_multi(ctx, params, outdir):
     cph, _ = _cox_fit(frame, data["time_col"], data["event_col"], used)
     cox = _cox_table(cph, used)
     forest = _forest_plot(cox, outdir, "Multivariable Cox", "forest_multi.png")
-    return result(
+    return _attach_cleaning(result(
         title="多因素 Cox",
         bullets=[f"{len(used)} 个变量，C-index={float(cph.concordance_index_):.3f}"],
         metrics={"cindex": float(cph.concordance_index_), "n_vars": len(used)},
         tables=[table("cox_multi", "多因素 Cox", list(cox.columns), cox)],
         figures=[forest] if forest else [],
         notes=["协变量默认取差异表达最显著基因（可用 params.covariates 指定）"],
-    )
+    ), data)
 
 
 def run_cutoff_scan(ctx, params, outdir):
@@ -584,14 +684,14 @@ def run_cutoff_scan(ctx, params, outdir):
     ax.set_title("Optimal cutoff scan")
     ax.legend(fontsize=8)
     figure = save_fig(fig, outdir, f"cutoff_{gene}.png", "Cutoff scan")
-    return result(
+    return _attach_cleaning(result(
         title="最佳截断值扫描",
         bullets=[f"{gene}：最佳阈值 {float(best['threshold']):.3g}（P={float(best['p_value']):.3g}，高表达 {int(best['n_high'])} 例）"],
         metrics={"gene": gene, "best_threshold": float(best["threshold"]), "best_p": float(best["p_value"])},
         tables=[table("cutoff_scan", "阈值扫描", list(frame.columns), frame)],
         figures=[figure],
         notes=["逐分位点扫描 log-rank 统计量；最优阈值存在选择偏倚，建议外部验证"],
-    )
+    ), data)
 
 
 def run_time_roc(ctx, params, outdir):
@@ -615,7 +715,7 @@ def run_time_roc(ctx, params, outdir):
     if not rocs:
         raise EngineError("prerequisite", "没有足够的事件/对照做时间 ROC")
     figure = _roc_figure(rocs, outdir, f"Time-dependent ROC ({gene})", f"roc_{gene}.png")
-    return result(
+    return _attach_cleaning(result(
         title="时间依赖 ROC",
         bullets=[f"{gene}：" + "、".join(f"{r['time']:g} 时点 AUC={r['auc']:.3f}" for r in rocs)],
         metrics={"gene": gene, "auc": {f"{r['time']:g}": round(r["auc"], 4) for r in rocs}},
@@ -627,7 +727,7 @@ def run_time_roc(ctx, params, outdir):
             [{"time": r["time"], "auc": r["auc"], "n_case": r["n_case"], "n_control": r["n_control"]} for r in rocs])],
         figures=[figure] if figure else [],
         notes=["时间 ROC 采用按时间点二分类 + 删失排除近似"],
-    )
+    ), data)
 
 
 def run_subgroup_forest(ctx, params, outdir):
@@ -685,10 +785,10 @@ def run_subgroup_forest(ctx, params, outdir):
     ax.set_xlabel("Hazard ratio (95% CI)")
     ax.set_title(f"Subgroup forest ({gene})")
     figure = save_fig(fig, outdir, f"forest_subgroup_{gene}.png", "Subgroup forest")
-    return result(title="亚组森林图", bullets=[f"{gene}：{len(out)} 个亚组"],
+    return _attach_cleaning(result(title="亚组森林图", bullets=[f"{gene}：{len(out)} 个亚组"],
                   metrics={"gene": gene, "n_subgroups": int(len(out))},
                   tables=[table("subgroup", "亚组 Cox", list(out.columns), out)],
-                  figures=[figure])
+                  figures=[figure]), data)
 
 
 def run_clinical_table(ctx, params, outdir):
@@ -701,6 +801,9 @@ def run_clinical_table(ctx, params, outdir):
     rows = []
     for col in info.columns:
         if col == group_col:
+            continue
+        # 内部列（清洗后的 _time/_event 等）不进基线表
+        if str(col).startswith("_"):
             continue
         series = info[col]
         if pd.api.types.is_numeric_dtype(series) and series.nunique() > 8:
@@ -724,10 +827,10 @@ def run_clinical_table(ctx, params, outdir):
                 row[g] = "；".join(f"{k}:{v}" for k, v in counts.head(3).items())
             rows.append(row)
     frame = pd.DataFrame(rows)
-    return result(title="临床基线表", bullets=[f"{len(frame)} 个变量 × {len(groups)} 组"],
+    return _attach_cleaning(result(title="临床基线表", bullets=[f"{len(frame)} 个变量 × {len(groups)} 组"],
                   metrics={"n_vars": int(len(frame)), "n_groups": len(groups)},
                   tables=[table("clinical", "基线特征", list(frame.columns), frame)],
-                  figures=[])
+                  figures=[]), data)
 
 
 STEPS = [

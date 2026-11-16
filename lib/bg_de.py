@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 import os
 import re
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -167,6 +168,8 @@ def _norm_params(params: dict, ctx: dict | None = None) -> dict:
         "lfc": max(0.0, _p_float(params.get("lfc"), 0.0)),
         "padj": min(1.0, max(1e-8, _p_float(params.get("padj"), 0.05))),
         "paired": _p_bool(params.get("paired"), False),
+        "pair_col": _p_str(params.get("pair_col") or params.get("pairing_col")),
+        "fail_on_fallback": _p_bool(params.get("fail_on_fallback"), False),
         "top_n": max(1, min(100, _p_int(params.get("top_n"), 20))),
         "order": order,
         "timeout": max(60, _p_int(params.get("timeout"), 900)),
@@ -349,8 +352,9 @@ def _resolve_case_control(params: dict, uniq: list[str], ctx: dict, group_col: s
     if not case and not control:
         inferred = _infer_pair(first, second)
         if inferred:
-            control, case = inferred
-            notes.append(f"未指定对比组，按关键字推断：{case} vs {control}")
+            # 契约：PairGuess 的字段名就是最终方向，不能按「first/second」位置解读
+            case, control = inferred.case, inferred.control
+            notes.append(f"未指定对比组，按关键字推断：{case} vs {control}（case - control）")
         else:
             order = [str(g) for g in (ctx.get("groups") or [])]
             if len(order) >= 2 and set(order[:2]) <= set(uniq):
@@ -367,7 +371,14 @@ def _resolve_case_control(params: dict, uniq: list[str], ctx: dict, group_col: s
     return case, control, notes
 
 
-def _infer_pair(first: str, second: str) -> tuple[str, str] | None:
+class PairGuess(NamedTuple):
+    """自动推断出的对比方向。**字段有名字**，调用方不得按位置猜（GEO-01）。"""
+
+    case: str
+    control: str
+
+
+def _infer_pair(first: str, second: str) -> PairGuess | None:
     def score(text: str, words) -> int:
         low = text.lower()
         return sum(1 for word in words if word in low)
@@ -375,9 +386,9 @@ def _infer_pair(first: str, second: str) -> tuple[str, str] | None:
     s1_case, s1_ctrl = score(first, _CASE_WORDS), score(first, _CTRL_WORDS)
     s2_case, s2_ctrl = score(second, _CASE_WORDS), score(second, _CTRL_WORDS)
     if s1_case > s1_ctrl and s2_ctrl > s2_case:
-        return first, second  # (case, control)
+        return PairGuess(case=first, control=second)
     if s2_case > s2_ctrl and s1_ctrl > s1_case:
-        return second, first
+        return PairGuess(case=second, control=first)
     return None
 
 
@@ -749,6 +760,84 @@ def _sort_frame(frame: pd.DataFrame, order: str) -> pd.DataFrame:
 # 核心计算
 # ---------------------------------------------------------------------------
 
+def _validate_pairs(
+    info: pd.DataFrame,
+    samples: list[str],
+    labels: list[str],
+    case: str,
+    control: str,
+    pair_col: str,
+    use_mask: np.ndarray,
+) -> tuple[np.ndarray, list[str], list[str]]:
+    """校验配对列并返回可用的样本掩码（GEO-03）。
+
+    规则：
+      * 配对 ID 缺失 → 直接报错（不允许悄悄当成独立样本）；
+      * 一对里只有一组样本 → 该对样本被剔除，并在 warnings 里列明；
+      * 一对里两组都有 ≥1 个样本即可（允许同一患者多时间点，pair 以固定效应进模型）；
+      * 有效对数 < 2 → 报错。
+    """
+    notes: list[str] = []
+    warnings: list[str] = []
+    values = []
+    for sample in samples:
+        raw = info.loc[sample, pair_col]
+        if isinstance(raw, pd.Series):
+            raw = raw.iloc[0]
+        if raw is None or pd.isna(raw) or str(raw).strip() in ("", "NA", "nan", "None"):
+            raise prerequisite(f"配对列「{pair_col}」在样本 {sample} 上是缺失值，无法配对；请补齐或剔除该样本")
+        values.append(str(raw).strip())
+
+    by_pair: dict[str, list[int]] = {}
+    for i, value in enumerate(values):
+        if not use_mask[i]:
+            continue
+        by_pair.setdefault(value, []).append(i)
+
+    keep = np.zeros(len(samples), dtype=bool)
+    complete: list[str] = []
+    incomplete: list[str] = []
+    for value, idx in by_pair.items():
+        kinds = {labels[i] for i in idx}
+        if case in kinds and control in kinds:
+            for i in idx:
+                keep[i] = True
+            complete.append(value)
+        else:
+            incomplete.append(value)
+
+    if incomplete:
+        warnings.append(
+            f"配对列「{pair_col}」里有 {len(incomplete)} 对缺少一组样本，已从本次配对分析中剔除："
+            f"{'、'.join(incomplete[:8])}"
+        )
+    dropped_n = int((use_mask & ~keep).sum())
+    if dropped_n:
+        notes.append(f"配对校验：{len(complete)} 对进入模型，剔除 {dropped_n} 个不成对样本")
+    if len(complete) < 2:
+        raise prerequisite(
+            f"配对列「{pair_col}」只有 {len(complete)} 对同时含「{case}」与「{control}」样本，至少需要 2 对；"
+            "无法配对时不会退化成独立样本检验"
+        )
+    return keep, notes, warnings
+
+
+def _should_fallback_r(prepared: dict) -> bool:
+    """R 调用失败时，是否允许改换 Python 实现（GEO-02）。
+
+    只有「R 环境本身不可用 / R 包缺失」才允许回退；数据问题和程序错误必须上抛，
+    否则用户会拿到一份和所选方法名不符的表格。
+    """
+    code = str(prepared.get("code") or "")
+    if code in ("no_r", "unsupported"):
+        return True
+    message = str(prepared.get("error") or "")
+    return bool(_R_PKG_MISSING.search(message))
+
+
+_R_PKG_MISSING = re.compile(r"没有安装|未安装|not installed|there is no package|could not find function", re.I)
+
+
 def _compute_de(ctx: dict, params: dict, outdir: str) -> dict:
     """差异分析核心：返回统一结构的 dict（供 run_de 与各分析复用）。"""
     p = _norm_params(params, ctx)
@@ -759,17 +848,51 @@ def _compute_de(ctx: dict, params: dict, outdir: str) -> dict:
     labels_arr = np.array(labels)
     case_mask = labels_arr == case
     ctrl_mask = labels_arr == control
+    notes: list[str] = list(cnotes)
+    warnings: list[str] = []
+    pair_col = ""
+    if p["paired"]:
+        use_mask = case_mask | ctrl_mask
+        pair_col = p["pair_col"] or _find_pair_col(info_all, samples, case_mask, ctrl_mask)
+        if not pair_col:
+            raise prerequisite(
+                "配对分析需要可用的配对列（如 patient_id）：样本表里没有找到一对一配对结构，"
+                "可用参数 pair_col 显式指定；不会退化成非配对检验"
+            )
+        if pair_col not in info_all.columns:
+            raise prerequisite(f"配对列「{pair_col}」不在样本信息表里")
+        keep_mask, pair_notes, pair_warnings = _validate_pairs(
+            info_all, samples, labels, case, control, pair_col, use_mask
+        )
+        notes.extend(pair_notes)
+        warnings.extend(pair_warnings)
+        if not np.array_equal(keep_mask, case_mask | ctrl_mask):
+            idx = np.flatnonzero(keep_mask)
+            X = X[idx]
+            samples = [samples[i] for i in idx]
+            labels = [labels[i] for i in idx]
+            labels_arr = np.array(labels)
+            case_mask = labels_arr == case
+            ctrl_mask = labels_arr == control
+            info_all = info_all.loc[samples]
+    else:
+        # 非配对：只保留参与比较的两组，保证 n_case/n_ctrl 与送进 R 的样本一致
+        use_mask = case_mask | ctrl_mask
+        if not use_mask.all():
+            idx = np.flatnonzero(use_mask)
+            X = X[idx]
+            samples = [samples[i] for i in idx]
+            labels = [labels[i] for i in idx]
+            labels_arr = np.array(labels)
+            case_mask = labels_arr == case
+            ctrl_mask = labels_arr == control
+            info_all = info_all.loc[samples]
     n_case = int(case_mask.sum())
     n_ctrl = int(ctrl_mask.sum())
     if n_case < 2 or n_ctrl < 2:
         raise prerequisite(
             f"分组「{case}」({n_case}) 或「{control}」({n_ctrl}) 的有效样本不足 2 个，无法做差异检验"
         )
-    pair_col = ""
-    if p["paired"]:
-        pair_col = _find_pair_col(info_all, samples, case_mask, ctrl_mask)
-    notes: list[str] = list(cnotes)
-    warnings: list[str] = []
     method = p["method"]
     effective = method
     lite = False
@@ -805,13 +928,22 @@ def _compute_de(ctx: dict, params: dict, outdir: str) -> dict:
             frame = frame.copy()
             frame["B"] = 0.0
         else:
+            if not _should_fallback_r(prepared):
+                # 数据问题或 R 程序错误：不换方法，明确失败并带上对比方向
+                raise EngineError(
+                    str(prepared.get("code") or "internal"),
+                    f"DESeq2（{case} - {control}）计算失败，未自动改换统计方法：{prepared.get('error')}",
+                )
             effective, lite = "welch", True
             log_cpm = _log_cpm(counts)
             frame, extra_notes = _welch_fallback(
                 log_cpm, genes, labels, samples, case, control, info_all, params_used, pair_col
             )
             notes.extend(extra_notes)
-            warnings.append(f"DESeq2（R）不可用：{prepared.get('error')}；已回退 Welch t 检验（lite）")
+            warnings.append(
+                f"请求的方法 DESeq2 因环境原因不可用（{prepared.get('error')}）；"
+                f"实际执行 Welch t 检验（lite），结论与 Methods 必须以 actual_method=welch 为准"
+            )
     elif method == "limma":
         Xlog, log_notes = _to_log_scale(X, ctx, "limma")
         notes.extend(log_notes)
@@ -825,12 +957,20 @@ def _compute_de(ctx: dict, params: dict, outdir: str) -> dict:
             warnings.extend(prepared.get("warnings") or [])
             notes.append("limma::lmFit + eBayes + topTable（R 官方实现）")
         else:
+            if not _should_fallback_r(prepared):
+                raise EngineError(
+                    str(prepared.get("code") or "internal"),
+                    f"limma（{case} - {control}）计算失败，未自动改换统计方法：{prepared.get('error')}",
+                )
             effective, lite = "welch", True
             frame, extra_notes = _welch_fallback(
                 Xlog, genes, labels, samples, case, control, info_all, params_used, pair_col
             )
             notes.extend(extra_notes)
-            warnings.append(f"limma（R）不可用：{prepared.get('error')}；已回退 Welch t 检验（lite）")
+            warnings.append(
+                f"请求的方法 limma 因环境原因不可用（{prepared.get('error')}）；"
+                f"实际执行 Welch t 检验（lite），结论与 Methods 必须以 actual_method=welch 为准"
+            )
     else:
         Xlog, log_notes = _to_log_scale(X, ctx, "welch")
         notes.extend(log_notes)
@@ -1041,11 +1181,17 @@ def _de_bullets(ctx: dict, computed: dict, frame: pd.DataFrame) -> list[str]:
     if computed["lite"] and computed["method"] == "welch" and computed["method_requested"] != "welch":
         method_label += "（回退）"
     bullets = [
-        f"{method_label}：{computed['case']} vs {computed['control']}（{computed['n_case']} vs {computed['n_ctrl']} 样本）",
+        f"{method_label}：{computed['case']} vs {computed['control']}"
+        f"（{computed['n_case']} vs {computed['n_ctrl']} 样本；logFC 方向 = {computed['case']} - {computed['control']}）",
         "FDR<{:g} 且 |logFC|≥{:g}：共 {} 个差异基因（上调 {} / 下调 {}）".format(
             p["padj"], p["lfc"], computed["n_sig"], computed["n_up"], computed["n_down"]
         ),
     ]
+    if computed.get("pair_col"):
+        bullets.append(f"配对设计：按「{computed['pair_col']}」配对，pair 已作为固定效应进入模型")
+    design = str((computed.get("r_metrics") or {}).get("design") or "")
+    if design:
+        bullets.append(f"设计矩阵：{design}")
     top = frame[frame["regulation"] != "ns"].head(5)
     if not top.empty:
         pieces = [f"{row['gene']}({row['logFC']:+.2f})" for _, row in top.iterrows()]
@@ -1057,9 +1203,13 @@ def _de_bullets(ctx: dict, computed: dict, frame: pd.DataFrame) -> list[str]:
 
 def _de_metrics(computed: dict) -> dict:
     p = computed["params"]
+    r_metrics = computed.get("r_metrics") or {}
     return {
         "method": computed["method"],
         "method_requested": computed["method_requested"],
+        "actual_method": computed["method"],
+        "design": r_metrics.get("design"),
+        "contrast": f"{computed['case']}-{computed['control']}",
         "lite": bool(computed["lite"]),
         "n_genes": computed["n_genes"],
         "n_case": computed["n_case"],
@@ -1070,6 +1220,8 @@ def _de_metrics(computed: dict) -> dict:
         "lfc": p["lfc"],
         "padj": p["padj"],
         "paired": bool(p["paired"]),
+        "pair_col": computed.get("pair_col") or "",
+        "n_pairs": r_metrics.get("n_pairs") or 0,
         "covars": list(p.get("covars") or []),
     }
 

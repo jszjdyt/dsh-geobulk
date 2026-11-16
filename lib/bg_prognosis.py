@@ -151,56 +151,124 @@ def _cindex(time, event, risk) -> float:
 # ---------------------------------------------------------------------------
 
 def _baseline_survival(cph, data: pd.DataFrame, time_col: str) -> tuple[np.ndarray, np.ndarray]:
-    timeline = np.linspace(0, float(np.nanmax(data[time_col])) * 1.02, 120)
+    """基线生存 S0(t)：**直接取已拟合 Cox 的 baseline_survival_**（GEO-05）。
+
+    旧实现把「所有患者预测生存率的均值」当 S0(t)，再按 exp(lp) 幂变换一次，
+    等于把协变量效应施加了两遍。这里只从拟合模型自身属性导出，取不到就明确报错，
+    绝不合成一条 `exp(-0.05*t)` 之类的假曲线。
+    """
+    frame = getattr(cph, "baseline_survival_", None)
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        raise EngineError("internal", "拟合好的 Cox 模型没有 baseline_survival_，无法给出基线生存曲线")
+    timeline = np.asarray(frame.index, dtype=float)
+    baseline = np.asarray(frame.iloc[:, 0], dtype=float)
+    if not np.all(np.isfinite(baseline)):
+        raise EngineError("internal", "拟合好的 Cox 模型 baseline_survival_ 含非有限值")
+    return timeline, baseline
+
+
+def _predict_survival(cph, data: pd.DataFrame, horizons: list[float]) -> np.ndarray:
+    """按已拟合模型取个体生存概率（行=horizon，列=样本）。缺必要基因时明确失败。"""
+    from lifelines import CoxPHFitter  # noqa: F401  # 仅确认依赖可导入
+
+    times = [float(h) for h in horizons if float(h) > 0]
+    if not times:
+        raise EngineError("prerequisite", "没有可用的预测时间点")
     try:
-        surv = cph.predict_survival_function(data, times=timeline)
-        return timeline, surv.values.mean(axis=1)
-    except Exception:  # noqa: BLE001
-        return timeline, np.exp(-0.05 * timeline)
+        surv = cph.predict_survival_function(data, times=times)
+    except Exception as error:  # noqa: BLE001
+        raise EngineError(
+            "prerequisite",
+            f"无法用已拟合的 Cox 模型做个体预测（可能缺少模型必需的基因/协变量列）：{error}",
+        )
+    values = np.asarray(surv.values, dtype=float)
+    if values.shape[0] == len(times) and values.shape[1] == len(data):
+        return values
+    if values.shape[0] == len(data) and values.shape[1] == len(times):
+        return values.T
+    raise EngineError("internal", f"predict_survival_function 返回了意外形状：{values.shape}")
 
 
 def calibration_curve(cph, data: pd.DataFrame, time_col: str, event_col: str, horizons: list[float]) -> pd.DataFrame:
-    timeline, baseline = _baseline_survival(cph, data, time_col)
-    lp = cph.predict_log_partial_hazard(data).values
+    """校准曲线：预测生存概率（同一已拟合模型）vs 分箱内 KM 观测生存率。"""
+    horizons = sorted({float(h) for h in horizons if float(h) > 0})
+    if not horizons:
+        return pd.DataFrame()
+    surv = _predict_survival(cph, data, horizons)
     rows = []
-    for horizon in horizons:
-        s0 = float(np.interp(horizon, timeline, baseline))
-        predicted = np.power(s0, np.exp(lp))
+    from lifelines import KaplanMeierFitter
+
+    for row_index, horizon in enumerate(horizons):
+        predicted = np.clip(surv[row_index], 0.0, 1.0)
         bins = pd.qcut(pd.Series(predicted).rank(method="first"), q=4, labels=False, duplicates="drop")
         for b in sorted(pd.Series(bins).dropna().unique()):
             mask = np.asarray(bins == b)
             if mask.sum() < 3:
                 continue
-            # 观测：KM 在 horizon 的生存率
             try:
-                from lifelines import KaplanMeierFitter
-
-                kmf = KaplanMeierFitter().fit(data[time_col].values[mask], data[event_col].values[mask])
+                kmf = KaplanMeierFitter().fit(
+                    pd.to_numeric(data[time_col], errors="coerce").values[mask],
+                    pd.to_numeric(data[event_col], errors="coerce").values[mask],
+                )
                 observed = float(kmf.predict(horizon))
             except Exception:  # noqa: BLE001
-                observed = float(np.mean(data[time_col].values[mask] > horizon))
+                observed = float(np.mean(pd.to_numeric(data[time_col], errors="coerce").values[mask] > horizon))
             rows.append({"horizon": horizon, "bin": int(b), "n": int(mask.sum()),
                          "predicted": float(np.mean(predicted[mask])), "observed": observed})
     return pd.DataFrame(rows)
 
 
 def decision_curve(cph, data: pd.DataFrame, time_col: str, event_col: str, horizon: float, steps: int = 25) -> pd.DataFrame:
-    timeline, baseline = _baseline_survival(cph, data, time_col)
-    s0 = float(np.interp(horizon, timeline, baseline))
-    lp = cph.predict_log_partial_hazard(data).values
-    risk = 1.0 - np.power(s0, np.exp(lp))
-    event_by_t = ((data[time_col].values <= horizon) & (data[event_col].values > 0)).astype(int)
-    n = len(data)
-    prevalence = float(event_by_t.mean())
+    """生存结局的决策曲线（KM 版净获益，GEO-05）。
+
+    旧实现把「时点前未观察到事件」的人一律记为阴性再算 TP/FP，等于把时点前删失者
+    当成随访充分且无事件，净获益会系统性偏移。这里改为在「按阈值处理 / 不处理」两组内
+    分别用 Kaplan-Meier 估计 t 时点事件风险，再算净获益：
+
+        NB(pt) = [1 - S_treat(t)] - [1 - S_notreat(t)] * pt/(1-pt)
+
+    与 dcurves/rmda 的 survival DCA 采用同一 KM 估计思路；不使用 IPCW 加权。
+    """
+    from lifelines import KaplanMeierFitter
+
+    horizon = float(horizon)
+    if horizon <= 0:
+        return pd.DataFrame()
+    surv = _predict_survival(cph, data, [horizon])
+    risk = 1.0 - np.clip(surv[0], 0.0, 1.0)
+    times = pd.to_numeric(data[time_col], errors="coerce").values.astype(float)
+    events = pd.to_numeric(data[event_col], errors="coerce").fillna(0).values.astype(float)
+    n = len(times)
+
+    def km_event(mask: np.ndarray) -> float | None:
+        if int(mask.sum()) < 3 or float(events[mask].sum()) < 1:
+            return None
+        try:
+            return float(1.0 - KaplanMeierFitter().fit(times[mask], events[mask]).predict(horizon))
+        except Exception:  # noqa: BLE001
+            return None
+
+    overall = km_event(np.ones(n, dtype=bool))
     rows = []
     for threshold in np.linspace(0.02, 0.8, steps):
-        predicted_positive = risk >= threshold
-        tp = float(np.sum(predicted_positive & (event_by_t == 1)) / n)
-        fp = float(np.sum(predicted_positive & (event_by_t == 0)) / n)
-        net_benefit = tp - fp * (threshold / (1 - threshold))
-        treat_all = prevalence - (1 - prevalence) * (threshold / (1 - threshold))
-        rows.append({"threshold": float(threshold), "net_benefit": net_benefit, "treat_all": treat_all,
-                     "n_positive": int(predicted_positive.sum())})
+        positive = risk >= threshold
+        if int(positive.sum()) < 3 or int((~positive).sum()) < 3:
+            continue
+        event_treat = km_event(positive)
+        event_untreat = km_event(~positive)
+        if event_treat is None or event_untreat is None:
+            continue
+        odds = threshold / (1.0 - threshold)
+        net_benefit = event_treat - event_untreat * odds
+        treat_all = None if overall is None else overall - (1.0 - overall) * odds
+        rows.append({
+            "threshold": float(threshold),
+            "net_benefit": float(net_benefit),
+            "treat_all": None if treat_all is None else float(treat_all),
+            "event_risk_treat": float(event_treat),
+            "event_risk_untreat": float(event_untreat),
+            "n_positive": int(positive.sum()),
+        })
     return pd.DataFrame(rows)
 
 
@@ -237,41 +305,68 @@ def _prognosis_payload(ctx, params, outdir, model: str | None = None) -> dict:
         coefs = cph.params_.reindex(selected).fillna(0.0)
         risk = np.asarray(frame[selected].values @ coefs.values, dtype=float)
         method = "LASSO-Cox（lifelines L1，penalizer=0.1）"
+        model_kind = "lasso_cox"
         notes.append("lifelines 的 L1 惩罚替代 glmnet；系数为惩罚后估计")
-    elif model in ("rsf", "random_forest"):
-        # bootstrap Cox 集成（RSF-lite）
-        rng = np.random.default_rng(0)
-        preds = []
-        n_boot = int(params.get("n_boot") or 50)
+    elif model in ("rsf", "random_forest", "ensemble"):
+        # 随机特征子集 + 患者 bootstrap 的 Cox 集成（**不是**随机生存森林，GEO-06）
+        rng = np.random.default_rng(int(params.get("seed") or 0))
+        n_boot = max(10, int(params.get("n_boot") or 200))
+        n_genes = len(genes)
+        subset_size = max(1, min(n_genes, int(np.sqrt(n_genes) + 2)))
+        preds: list[np.ndarray] = []
+        coef_rows_all: list[pd.Series] = []
+        n_rows = len(frame)
         for _ in range(n_boot):
-            pick = rng.choice(genes, size=max(3, min(len(genes), int(np.sqrt(len(genes)) + 2))), replace=False)
+            size = max(2, min(subset_size, n_genes))
+            pick = rng.choice(n_genes, size=size, replace=False) if size < n_genes else np.arange(n_genes)
+            picked = [genes[i] for i in np.atleast_1d(pick)]
+            # 患者（行）bootstrap：没有这一步就只是「随机抽基因」，不构成集成学习
+            rows = rng.integers(0, n_rows, n_rows)
+            sample_frame = frame.iloc[rows]
             try:
-                cph_b, _ = _fit_cox(frame, time_col, event_col, list(pick), penalizer=0.05)
-                preds.append(cph_b.predict_log_partial_hazard(frame).values)
+                cph_b, _ = _fit_cox(sample_frame, time_col, event_col, picked, penalizer=0.05)
+                preds.append(np.asarray(cph_b.predict_log_partial_hazard(frame).values, dtype=float))
+                coef_rows_all.append(cph_b.params_.reindex(genes).fillna(0.0))
             except EngineError:
                 continue
         if not preds:
             raise EngineError("prerequisite", "bootstrap Cox 全部失败（样本/事件太少）")
         risk = np.nanmean(np.vstack(preds), axis=0)
-        method = f"RSF-lite（{len(preds)} 次 bootstrap Cox 集成）"
-        notes.append("sksurv 不可用，随机生存森林以 bootstrap Cox 集成近似；结果不等同官方 RSF")
-        cph, _ = _fit_cox(frame, time_col, event_col, genes, penalizer=0.05)
         selected = genes
+        method = f"随机特征子集 + 患者 bootstrap 的 Cox 集成（{len(preds)} 次）"
+        model_kind = "subset_bootstrap_cox_ensemble"
+        notes.append(
+            "这不是随机生存森林（RSF）：实现是「随机抽基因子集 + 患者有放回重采样」的 Cox 线性预测均值；"
+            "如需官方 RSF 请安装 sksurv 后使用专用分析"
+        )
+        # 校准/DCA 需要一个有预测接口的单一模型：对集成风险再拟合一个单变量 Cox（重校准模型）
+        calib_frame = frame[[time_col, event_col]].copy()
+        calib_frame["_ensemble_risk"] = risk
+        cph, _ = _fit_cox(calib_frame, time_col, event_col, ["_ensemble_risk"], penalizer=0.0)
+        coef_frame = pd.DataFrame([
+            {"gene": gene,
+             "coef": float(np.mean([c.get(gene, 0.0) for c in coef_rows_all])) if coef_rows_all else 0.0,
+             "selection_freq": float(np.mean([abs(c.get(gene, 0.0)) > 1e-9 for c in coef_rows_all])) if coef_rows_all else 0.0}
+            for gene in genes
+        ])
+        notes.append("系数表为集成内各次拟合的平均系数与入选频率；校准/DCA 用「对集成风险再拟合的单变量 Cox」")
     else:
         cph, _ = _fit_cox(frame, time_col, event_col, genes, penalizer=0.01)
         selected = genes
         risk = np.asarray(cph.predict_log_partial_hazard(frame).values, dtype=float)
         method = "Cox 比例风险模型（lifelines）"
+        model_kind = "cox"
 
-    # 系数表
-    coef_rows = []
-    for gene in selected:
-        if gene not in cph.params_.index:
-            continue
-        coef_rows.append({"gene": gene, "coef": float(cph.params_[gene]),
-                          "HR": float(np.exp(cph.params_[gene])),
-                          "p": float(cph.summary.loc[gene, "p"]) if gene in cph.summary.index else None})
-    coef_frame = pd.DataFrame(coef_rows)
+    # 系数表（rsf 分支已在上面生成）
+    if model in ("rsf", "random_forest", "ensemble"):
+        pass
+    else:
+        coef_frame = pd.DataFrame([
+            {"gene": gene, "coef": float(cph.params_[gene]),
+             "HR": float(np.exp(cph.params_[gene])),
+             "p": float(cph.summary.loc[gene, "p"]) if gene in cph.summary.index else None}
+            for gene in selected if gene in cph.params_.index
+        ])
     if not coef_frame.empty:
         tables.append(table("model_coef", "模型系数", list(coef_frame.columns), coef_frame))
 
@@ -332,7 +427,10 @@ def _prognosis_payload(ctx, params, outdir, model: str | None = None) -> dict:
             if not dca.empty:
                 fig, ax = new_fig(6.2, 4.8)
                 ax.plot(dca["threshold"], dca["net_benefit"], color="#c0392b", linewidth=1.6, label="Model")
-                ax.plot(dca["threshold"], dca["treat_all"], color="#7f8c9b", linestyle="--", linewidth=1.0, label="Treat all")
+                treat_all = dca.dropna(subset=["treat_all"])
+                if not treat_all.empty:
+                    ax.plot(treat_all["threshold"], treat_all["treat_all"], color="#7f8c9b",
+                            linestyle="--", linewidth=1.0, label="Treat all")
                 ax.axhline(0, color="#2b2f36", linewidth=0.8)
                 ax.set_xlabel("Risk threshold")
                 ax.set_ylabel("Net benefit")
@@ -343,30 +441,43 @@ def _prognosis_payload(ctx, params, outdir, model: str | None = None) -> dict:
     except EngineError as error:
         warnings.append(f"DCA 跳过：{error.message}")
 
-    # 列线图数据（系数 + 基线生存）
-    timeline, baseline = _baseline_survival(cph, data["frame"], time_col)
-    nomogram_rows = [{"variable": gene, "coef": float(cph.params_[gene]), "HR": float(np.exp(cph.params_[gene])),
-                      "points_per_unit": float(abs(cph.params_[gene]) * 100)} for gene in selected if gene in cph.params_.index]
-    nomogram_rows.append({"variable": "baseline", "coef": 0.0, "HR": None,
-                          "points_per_unit": None})
-    nomogram = pd.DataFrame(nomogram_rows)
-    tables.append(table("nomogram", "列线图数据（系数与单位分值）", list(nomogram.columns), nomogram))
-    tables.append(table("baseline_survival", "基线生存 S0(t)", [{"key": "time", "label": "时间", "type": "number"},
-                                                              {"key": "S0", "label": "S0(t)", "type": "number"}],
-                        [{"time": float(t), "S0": float(s)} for t, s in zip(timeline[::10], baseline[::10])]))
+    # 列线图数据（系数 + 基线生存）：基线直接来自已拟合模型，缺失则明确失败（GEO-05）
+    try:
+        timeline, baseline = _baseline_survival(cph, frame, time_col)
+        # 系数一律取自系数表（rsf 集成分支的 cph 只是重校准模型，不含基因项）
+        coef_lookup = {row["gene"]: float(row["coef"]) for _, row in coef_frame.iterrows()} if not coef_frame.empty else {}
+        nomogram_rows = [{"variable": gene, "coef": coef_lookup[gene],
+                          "HR": float(np.exp(coef_lookup[gene])),
+                          "points_per_unit": float(abs(coef_lookup[gene]) * 100)}
+                         for gene in selected if gene in coef_lookup]
+        nomogram_rows.append({"variable": "baseline", "coef": 0.0, "HR": None, "points_per_unit": None})
+        nomogram = pd.DataFrame(nomogram_rows)
+        tables.append(table("nomogram", "列线图数据（系数与单位分值）", list(nomogram.columns), nomogram))
+        tables.append(table("baseline_survival", "基线生存 S0(t)", [
+            {"key": "time", "label": "时间", "type": "number"},
+            {"key": "S0", "label": "S0(t)", "type": "number"}],
+            [{"time": float(t), "S0": float(s)} for t, s in zip(timeline[::10], baseline[::10])]))
+    except EngineError as error:
+        warnings.append(f"列线图/基线生存未生成：{error.message}")
 
     tables.insert(0, table("risk_score", "风险评分表", list(risk_frame.columns), risk_frame))
     path = export_csv(risk_frame, outdir, "risk_scores")
     data_out.append(data_file("risk_csv", path, "风险评分表"))
 
-    bullets.append(f"{method}：{len(selected)} 个基因，C-index={cindex:.3f}")
+    # GEO-06：明确标注这是训练集表观性能，不是外部验证结果
+    evaluation_scope = "apparent_training_set"
+    bullets.append(f"{method}：{len(selected)} 个基因，C-index={cindex:.3f}（**训练集表观性能**）")
     if logrank_p is not None:
-        bullets.append(f"高低风险组 log-rank P={logrank_p:.3g}")
+        bullets.append(f"高低风险组 log-rank P={logrank_p:.3g}（训练集表观）")
     if rocs:
-        bullets.append("时间 ROC：" + "、".join(f"{r['time']:g}={r['auc']:.3f}" for r in rocs))
-    metrics = {"model": model, "n_genes": len(selected), "cindex": cindex, "logrank_p": logrank_p,
+        bullets.append("时间 ROC：" + "、".join(f"{r['time']:g}={r['auc']:.3f}" for r in rocs) + "（训练集表观）")
+    metrics = {"model": model, "model_kind": model_kind, "n_genes": len(selected),
+               "cindex": cindex, "cindex_scope": evaluation_scope,
+               "logrank_p": logrank_p,
                "cutoff": cutoff, "n_samples": int(len(risk_frame)),
+               "n_events": int((risk_frame["event"] > 0).sum()),
                "auc": {f"{r['time']:g}": round(r["auc"], 4) for r in rocs}}
+    metrics["evaluation_scope"] = "训练集表观性能（apparent）；基因筛选/拟合/阈值/指标均在同一样本上完成，未做外部验证"
 
     payload = result(
         title="高级预后分析",
@@ -374,8 +485,11 @@ def _prognosis_payload(ctx, params, outdir, model: str | None = None) -> dict:
         metrics=metrics,
         tables=tables,
         figures=figures,
-        warnings=warnings,
-        notes=notes + ["风险评分 = 线性预测值；分组阈值为中位数（可用 cutoff 调整）"],
+        warnings=warnings + list(data.get("warnings") or []),
+        notes=notes + [
+            "风险评分 = 线性预测值；分组阈值为中位数（可用 cutoff 调整）",
+            "评估口径：全部指标来自训练集表观性能，不能当作外部验证/前瞻验证结果；临床应用前需要独立队列验证",
+        ],
         data_out=data_out,
     )
     payload["store"] = {

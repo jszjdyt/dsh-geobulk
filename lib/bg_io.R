@@ -3,6 +3,15 @@
 #
 # 用法：
 #   Rscript --vanilla bg_io.R --in <file.rds|.RData> --out <dir> [--object NAME] [--inspect]
+#   Rscript --vanilla bg_io.R --annotate --genes <genes.txt> --out <dir> --species human|mouse \
+#           --keytype SYMBOL|ENSEMBL|ENTREZID|REFSEQ
+#
+# --annotate（基因标识符注释，任务单第七节建议 2）：用 AnnotationDbi +
+#   org.Hs.eg.db / org.Mm.eg.db 把 ID 映射到 SYMBOL，输出：
+#   annotation.tsv  input_id\tsymbol（映射不到的 symbol 留空，不猜测）
+#   meta.tsv        status ok|unavailable|error / database / database_version / keytype /
+#                   n_input / n_mapped / one_to_many / many_to_one
+#   注释包不存在时 status=unavailable（退出码 0），由 Python 侧退化成纯报告，不硬造映射。
 #
 # 输出（都在 --out 目录）：
 #   meta.tsv        key\tvalue（status/class/n_genes/n_samples/has_counts/notes/warnings/error）
@@ -29,14 +38,29 @@ in_path <- get_arg("--in")
 out_dir <- get_arg("--out")
 object_name <- get_arg("--object")
 inspect_only <- has_flag("--inspect")
+annotate_mode <- has_flag("--annotate")
 
-if (is.null(in_path) || is.null(out_dir)) {
-  cat("用法：bg_io.R --in <file> --out <dir> [--object NAME] [--inspect]\n", file = stderr())
+usage <- function() {
+  cat("用法：\n",
+      "  Rscript --vanilla bg_io.R --in <file> --out <dir> [--object NAME] [--inspect]\n",
+      "  Rscript --vanilla bg_io.R --annotate --genes <genes.txt> --out <dir>",
+      " --species human|mouse --keytype SYMBOL|ENSEMBL|ENTREZID|REFSEQ\n",
+      file = stderr())
+}
+
+if (is.null(out_dir)) {
+  usage()
   quit(save = "no", status = 2)
 }
-if (!file.exists(in_path)) {
-  cat(paste0("文件不存在：", in_path, "\n"), file = stderr())
-  quit(save = "no", status = 1)
+if (!annotate_mode) {
+  if (is.null(in_path)) {
+    usage()
+    quit(save = "no", status = 2)
+  }
+  if (!file.exists(in_path)) {
+    cat(paste0("文件不存在：", in_path, "\n"), file = stderr())
+    quit(save = "no", status = 1)
+  }
 }
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
@@ -66,6 +90,113 @@ fail <- function(msg) {
   write_meta(list(status = "error", error = msg))
   cat(paste0(msg, "\n"), file = stderr())
   quit(save = "no", status = 1)
+}
+
+# ---------------------------------------------------------------------------
+# --annotate：基因标识符 ID → SYMBOL 注释报告（本机 AnnotationDbi / org.*.eg.db）
+# ---------------------------------------------------------------------------
+
+annotation_unavailable <- function(reason, database = "", version = "", keytype = "",
+                                   n_input = 0) {
+  write_meta(list(status = "unavailable", database = database,
+                  database_version = version, keytype = keytype,
+                  n_input = n_input, n_mapped = 0, one_to_many = 0, many_to_one = 0,
+                  error = reason))
+  cat(paste0(reason, "\n"), file = stderr())
+  quit(save = "no", status = 0)
+}
+
+run_annotation <- function() {
+  genes_path <- get_arg("--genes")
+  species <- tolower(get_arg("--species", "human"))
+  keytype <- toupper(get_arg("--keytype", "SYMBOL"))
+  if (is.null(genes_path) || !file.exists(genes_path)) {
+    annotation_unavailable("--annotate 模式缺少 --genes 文件", keytype = keytype)
+  }
+  genes <- tryCatch(readLines(genes_path, warn = FALSE, encoding = "UTF-8"),
+                    error = function(e) character(0))
+  genes <- unique(genes[nzchar(trimws(genes))])
+  if (length(genes) == 0) {
+    annotation_unavailable("基因列表为空，没有可映射的 ID", keytype = keytype)
+  }
+  pkg <- switch(species,
+                human = "org.Hs.eg.db",
+                mouse = "org.Mm.eg.db",
+                NULL)
+  if (is.null(pkg)) {
+    annotation_unavailable(paste0("不支持的物种（只支持 human / mouse）：", species),
+                           keytype = keytype, n_input = length(genes))
+  }
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    annotation_unavailable(paste0("缺少 R 注释包：", pkg), database = pkg,
+                           keytype = keytype, n_input = length(genes))
+  }
+  if (!requireNamespace("AnnotationDbi", quietly = TRUE)) {
+    annotation_unavailable("缺少 R 注释包：AnnotationDbi", database = pkg,
+                           keytype = keytype, n_input = length(genes))
+  }
+  db <- tryCatch(getExportedValue(pkg, pkg), error = function(e) NULL)
+  if (is.null(db)) {
+    annotation_unavailable(paste0("无法加载注释库对象：", pkg), database = pkg,
+                           keytype = keytype, n_input = length(genes))
+  }
+  valid_types <- tryCatch(AnnotationDbi::keytypes(db), error = function(e) character(0))
+  if (!keytype %in% valid_types) {
+    annotation_unavailable(paste0(pkg, " 不支持 keytype：", keytype),
+                           database = pkg, keytype = keytype, n_input = length(genes))
+  }
+  version <- tryCatch(as.character(utils::packageVersion(pkg)), error = function(e) "")
+  one_to_many <- 0L
+  if (keytype == "SYMBOL") {
+    # 注意：mapIds(column="SYMBOL", keytype="SYMBOL") 会把未知 key 原样返回（看起来
+    # 100% 覆盖）。必须用 keys(db, "SYMBOL") 校验，未知 symbol 留空，不伪造映射。
+    valid_keys <- tryCatch(AnnotationDbi::keys(db, keytype = "SYMBOL"),
+                           error = function(e) character(0))
+    if (length(valid_keys) == 0) {
+      annotation_unavailable(paste0("无法读取 ", pkg, " 的 SYMBOL keys"),
+                             database = pkg, version = version, keytype = keytype,
+                             n_input = length(genes))
+    }
+    idx <- match(toupper(genes), toupper(valid_keys))
+    symbols <- ifelse(is.na(idx), "", valid_keys[idx])
+  } else {
+    mapped <- tryCatch(
+      suppressMessages(AnnotationDbi::mapIds(db, keys = genes, column = "SYMBOL",
+                                             keytype = keytype, multiVals = "first")),
+      error = function(e) NULL)
+    if (is.null(mapped)) {
+      annotation_unavailable(paste0("AnnotationDbi::mapIds 失败（", keytype, " → SYMBOL）"),
+                             database = pkg, version = version, keytype = keytype,
+                             n_input = length(genes))
+    }
+    multi <- tryCatch(
+      suppressMessages(AnnotationDbi::mapIds(db, keys = genes, column = "SYMBOL",
+                                             keytype = keytype, multiVals = "list")),
+      error = function(e) NULL)
+    one_to_many <- if (is.null(multi)) 0L else
+      sum(vapply(multi, function(values) length(unique(values)) > 1, logical(1)))
+    symbols <- as.character(mapped)
+    symbols[is.na(symbols)] <- ""
+  }
+  keep <- nzchar(symbols)
+  n_mapped <- sum(keep)
+  many_to_one <- if (n_mapped > 0) sum(duplicated(symbols[keep])) else 0L
+  frame <- data.frame(input_id = genes,
+                      symbol = symbols,
+                      stringsAsFactors = FALSE)
+  write.table(frame, file = file.path(out_dir, "annotation.tsv"),
+              sep = "\t", quote = FALSE, row.names = FALSE, fileEncoding = "UTF-8")
+  write_meta(list(status = "ok", database = pkg, database_version = version,
+                  keytype = keytype, n_input = length(genes), n_mapped = n_mapped,
+                  one_to_many = one_to_many, many_to_one = many_to_one,
+                  notes = "AnnotationDbi::mapIds(multiVals='first')；无 GPL 平台表时不做 probe 猜测",
+                  warnings = ""))
+  quit(save = "no", status = 0)
+}
+
+if (annotate_mode) {
+  run_annotation()
+  quit(save = "no", status = 0)
 }
 
 # ---------------------------------------------------------------------------

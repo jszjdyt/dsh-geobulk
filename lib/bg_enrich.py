@@ -215,7 +215,17 @@ def _es_score(ranked_genes: list[str], gene_set: set[str], weights: np.ndarray) 
 
 
 def gsea(de: pd.DataFrame, gene_sets: dict, names: dict, db_label: str, nperm: int = 1000, seed: int = 0,
-         min_size: int = MIN_SET_SIZE, max_size: int = MAX_SET_SIZE) -> pd.DataFrame:
+         min_size: int = MIN_SET_SIZE, max_size: int = MAX_SET_SIZE,
+         use_r: bool = True, outdir: str | None = None,
+         provenance: dict | None = None) -> pd.DataFrame:
+    """GSEA。优先调用 R `fgsea::fgseaMultilevel`（官方 NES 定义）。
+
+    自实现分支的统计量按官方定义重写（GEO-08）：
+      * NES = ES / mean(同号置换 ES)，正负两侧分别归一化；
+      * 单侧 p 值分母是**同号置换次数**，而不是全部置换次数；
+      * 结果里带 actual_method / software_version / permutation / coverage，
+        并且方法名不会再让人误以为一定来自官方实现。
+    """
     if "logFC" not in de.columns:
         raise EngineError("prerequisite", "GSEA 需要差异结果的 logFC 列")
     frame = de.dropna(subset=["logFC"]).copy()
@@ -227,39 +237,117 @@ def gsea(de: pd.DataFrame, gene_sets: dict, names: dict, db_label: str, nperm: i
     n = len(ranked)
     if n < 50:
         raise EngineError("prerequisite", f"排序基因只有 {n} 个，太少，无法做 GSEA")
+    provenance = dict(provenance or {})
+    provenance.setdefault("gene_set_source", db_label)
+    provenance["coverage"] = {
+        "n_ranked": int(n),
+        "n_sets_input": int(len(gene_sets)),
+    }
+
+    if use_r:
+        official = _gsea_fgsea(frame, gene_sets, names, db_label, nperm, seed, min_size, max_size, outdir, provenance)
+        if official is not None:
+            return official
+
     rng = np.random.default_rng(seed)
     rows = []
+    pool = np.array(ranked)
     for key, members in gene_sets.items():
         member_set = {str(g).upper() for g in members}
         size = len(member_set & set(ranked))
         if size < min_size or size > max_size:
             continue
         es = _es_score(ranked, member_set, weights)
-        # 置换：随机抽取同样大小的基因集
         null = np.empty(nperm, dtype=np.float64)
-        pool = np.array(ranked)
         for i in range(nperm):
             sample = rng.choice(pool, size=size, replace=False)
             null[i] = _es_score(ranked, set(sample.tolist()), weights)
         if es >= 0:
-            pvalue = float((np.sum(null >= es) + 1) / (nperm + 1))
+            same = null[null >= 0]
+            same = same if same.size else np.zeros(1)
+            denom = float(np.mean(same))
+            nes = float(es / denom) if denom > 0 else 0.0
+            pvalue = float((int(np.sum(same >= es)) + 1) / (same.size + 1))
         else:
-            pvalue = float((np.sum(null <= es) + 1) / (nperm + 1))
+            same = null[null < 0]
+            same = same if same.size else np.zeros(1)
+            denom = float(-np.mean(same))
+            nes = float(es / denom) if denom > 0 else 0.0
+            pvalue = float((int(np.sum(same <= es)) + 1) / (same.size + 1))
         rows.append({
             "Database": db_label,
             "ID": key,
             "Description": names.get(key, key),
             "SetSize": int(size),
             "ES": es,
-            "NES": float(es / (np.std(null) + 1e-9)) if np.std(null) > 0 else 0.0,
+            "NES": nes,
             "pvalue": pvalue,
             "geneID": "/".join(sorted(member_set & set(ranked))[:200]),
+            "actual_method": "gsea_python（自实现加权 KS + 基因集置换）",
         })
     if not rows:
         return pd.DataFrame()
     out = pd.DataFrame(rows)
     out["p.adjust"] = bh_fdr(out["pvalue"].values)
+    out.attrs["provenance"] = {
+        **provenance,
+        "actual_method": "gsea_python",
+        "software": "dsh-geobulk 自实现",
+        "permutation": f"基因集随机置换 {nperm} 次（seed={seed}），NES 按同号置换 ES 均值归一化",
+        "nes_definition": "官方 GSEA 定义（按符号归一化）",
+    }
     return out.sort_values(["p.adjust", "pvalue"]).reset_index(drop=True)
+
+
+def _gsea_fgsea(frame: pd.DataFrame, gene_sets: dict, names: dict, db_label: str, nperm: int, seed: int,
+                 min_size: int, max_size: int, outdir: str | None, provenance: dict) -> pd.DataFrame | None:
+    """调用 R fgsea；R/fgsea 不可用或输入不满足时返回 None（由自实现接管，并标明实际方法）。"""
+    import rbridge
+
+    if outdir is None:
+        return None
+    if not (rbridge.r_available() and rbridge.has_pkg("fgsea")):
+        return None
+    ranked = frame[["gene", "logFC"]].copy()
+    ranked.columns = ["gene", "logFC"]
+    set_rows = [{"term": str(key), "gene": str(gene).upper()}
+                for key, members in gene_sets.items() for gene in members]
+    if not set_rows:
+        return None
+    payload = {
+        "extra": {"ranked": ranked, "sets": pd.DataFrame(set_rows)},
+        "params": {"min_size": int(min_size), "max_size": int(max_size), "seed": int(seed), "nperm": int(nperm)},
+    }
+    try:
+        outgoing = rbridge.run_r("bg_gsea.R", payload, outdir, timeout=1800)
+    except EngineError as error:
+        if error.code in ("runtime",):
+            raise
+        return None
+    tables = outgoing.get("tables") or {}
+    table = tables.get("gsea")
+    if table is None or not isinstance(table, pd.DataFrame) or table.empty:
+        return None
+    metrics = ((outgoing.get("result") or {}).get("summary") or {}).get("metrics") or {}
+    out = table.copy()
+    out.insert(0, "Database", db_label)
+    out["ID"] = out["pathway"]
+    if "Description" not in out.columns:
+        out["Description"] = out["pathway"]
+    out["Description"] = [
+        names.get(str(pid), str(desc)) for pid, desc in zip(out["pathway"], out["Description"])
+    ]
+    out = out[["Database", "ID", "Description", "SetSize", "ES", "NES", "pvalue", "p.adjust", "geneID"]]
+    out.attrs["provenance"] = {
+        **provenance,
+        "actual_method": metrics.get("actual_method") or "fgsea::fgseaMultilevel",
+        "software": metrics.get("software") or "fgsea",
+        "software_version": metrics.get("software_version"),
+        "permutation": metrics.get("permutation"),
+        "nes_definition": "官方 GSEA 定义（fgsea 实现）",
+        "coverage": {**provenance.get("coverage", {}), "n_sets_tested": int(len(out))},
+    }
+    return out
 
 
 def ssgsea_scores(ctx, gene_sets: dict, names: dict, max_sets: int = 60) -> pd.DataFrame:
@@ -350,6 +438,7 @@ def _run_enrichment(ctx, params: dict, outdir: str):
     frames = []
     warnings = []
     notes = []
+    gsea_provenance: dict = {}
     for db in dbs:
         try:
             prepared = _prepare_sets(db, workdir)
@@ -358,9 +447,11 @@ def _run_enrichment(ctx, params: dict, outdir: str):
             continue
         label = DB_LABELS.get(db, db)
         if method == "gsea":
-            frame = gsea(de, prepared["sets"], prepared["names"], label)
+            frame = gsea(de, prepared["sets"], prepared["names"], label, outdir=outdir,
+                         provenance={"db_key": db, "gene_set_source": label})
             if frame is not None and not frame.empty:
                 frames.append(frame)
+                gsea_provenance.update(getattr(frame, "attrs", {}).get("provenance") or {})
             continue
         directions = ["up", "down"] if direction in ("both", "all") else [direction]
         parts = []
@@ -408,6 +499,13 @@ def _run_enrichment(ctx, params: dict, outdir: str):
         "n_significant": int(len(sig)),
         "n_genes": int(len(_gene_list(de, direction, padj_cut, lfc_cut))),
     }
+    if method == "gsea":
+        metrics["actual_method"] = gsea_provenance.get("actual_method")
+        metrics["software"] = gsea_provenance.get("software")
+        metrics["software_version"] = gsea_provenance.get("software_version")
+        metrics["permutation"] = gsea_provenance.get("permutation")
+        metrics["gene_set_source"] = "builtin GMT / Enrichr 缓存"
+        metrics["coverage"] = gsea_provenance.get("coverage")
     payload = result(
         title="功能富集",
         bullets=bullets,
@@ -415,7 +513,14 @@ def _run_enrichment(ctx, params: dict, outdir: str):
         tables=tables,
         figures=figures,
         warnings=warnings,
-        notes=notes + [f"富集实现：{'加权 KS + 置换（GSEA）' if method == 'gsea' else '超几何检验（ORA）'}；基因集：内置 GMT / Enrichr 缓存"],
+        notes=notes + (
+            [f"GSEA 实际实现：{gsea_provenance.get('actual_method') or '未知'}（软件 {gsea_provenance.get('software') or '?'}"
+             f"{' ' + str(gsea_provenance.get('software_version')) if gsea_provenance.get('software_version') else ''}）；"
+             f"置换策略：{gsea_provenance.get('permutation') or '未记录'}；NES 定义：{gsea_provenance.get('nes_definition') or '未记录'}；"
+             f"基因集来源：builtin GMT / Enrichr 缓存"]
+            if method == "gsea" else
+            ["富集实现：超几何检验（ORA）；基因集：内置 GMT / Enrichr 缓存"]
+        ),
         data_out=data_out,
     )
     payload["store"] = {

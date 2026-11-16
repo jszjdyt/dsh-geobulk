@@ -344,6 +344,453 @@ def _infer_species(genes) -> str:
     return "unknown"
 
 
+# ---------------------------------------------------------------------------
+# 基因标识符 / 物种确认：独立的 ID→gene symbol 映射报告
+# ---------------------------------------------------------------------------
+#
+# 目的（任务单第七节建议 2）：芯片矩阵 / GEO series matrix 的标识符可能是
+# GPL probe ID、Ensembl、Entrez、RefSeq 或 gene symbol；直接把它当基因名会让
+# 富集 / 免疫 / 单细胞匹配静默失败。这里先做「识别 + 报告」，映射优先走 R 侧
+# AnnotationDbi（org.Hs.eg.db / org.Mm.eg.db）；拿不到注释库时只报告 ID 类型与
+# 覆盖率，不伪造映射。未知 ID 与「按 0 填充的缺失表达」都不等于真实零表达。
+
+_ID_TYPE_LABELS = {
+    "symbol": "基因符号（Gene symbol，如 TP53）",
+    "ensembl_gene": "Ensembl 基因 ID（如 ENSG00000141510）",
+    "entrez": "Entrez Gene ID（纯数字，如 7157）",
+    "refseq": "RefSeq 转录本 ID（NM_/NR_/XM_/XR_）",
+    "ensembl_transcript": "Ensembl 转录本 ID（ENST…，需要 tx2gene 才能换成基因）",
+    "accession": "GenBank/EMBL 登录号（如 X00351，可用 ACCNUM 注释）",
+    "probe_id": "芯片 probe ID（如 1007_s_at / ILMN_1234，需要 GPL 平台注释表）",
+    "numeric": "纯数字 ID（Entrez 或数字 probe，类型不确定）",
+    "mixed": "混合标识符（多种类型同时存在）",
+    "unknown": "无法识别的标识符",
+}
+_ID_TYPE_KEYTYPES = {"symbol": "SYMBOL", "ensembl_gene": "ENSEMBL",
+                     "entrez": "ENTREZID", "refseq": "REFSEQ", "accession": "ACCNUM"}
+_GENE_MATRIX_FORMATS = {"matrix_text", "geo_series", "xlsx", "rds", "rdata", "auto"}
+
+_SPECIES_ALIASES = {
+    "human": "human", "homo sapiens": "human", "hs": "human", "人": "human", "人类": "human",
+    "mouse": "mouse", "mus musculus": "mouse", "mm": "mouse", "小鼠": "mouse",
+    "rat": "rat", "rattus norvegicus": "rat", "大鼠": "rat",
+    "zebrafish": "zebrafish", "danio rerio": "zebrafish", "斑马鱼": "zebrafish",
+}
+
+_ENSEMBL_GENE_RE = re.compile(r"^ENS[A-Z]*G\d{6,}(?:\.\d+)?$", re.I)
+_ENSEMBL_TRANSCRIPT_RE = re.compile(r"^ENS[A-Z]*T\d{6,}(?:\.\d+)?$", re.I)
+_ENTREZ_RE = re.compile(r"^\d{1,10}$")
+_REFSEQ_RE = re.compile(r"^(?:NM|NR|XM|XR|NP|XP|NG|NC)_\d+(?:\.\d+)?$", re.I)
+_ACCESSION_RE = re.compile(r"^[A-Z]{1,2}\d{5,6}(?:\.\d+)?$")
+_PROBE_RES = (
+    re.compile(r"^\d+_s?_?at$", re.I),        # Affymetrix：1007_s_at / 1053_at
+    re.compile(r"^AFFX[-_]", re.I),            # Affymetrix AFFX 对照探针
+    re.compile(r"^ILMN_\d+$", re.I),           # Illumina：ILMN_1234
+    re.compile(r"^A_\d+_[PR]\d+$", re.I),      # Agilent：A_23_P12345
+    re.compile(r"^_\d+$"),                     # 部分平台的 _12345
+    re.compile(r"^\d+_\d+$"),                 # 数字_数字 probe
+)
+_SYMBOL_UPPER_RE = re.compile(r"^[A-Z][A-Z0-9_.\-']{1,20}$")          # 人/大写符号（HBB-3'HS1）
+_SYMBOL_TITLE_RE = re.compile(r"^[A-Z][a-z][A-Za-z0-9\-']{0,15}$")    # 小鼠 Tp53
+_SYMBOL_ORF_RE = re.compile(r"^C[A-Z0-9]+orf\d+(?:-[A-Za-z0-9]+)?$", re.I)  # 人 C11orf21
+_SYMBOL_PREFIX_RE = re.compile(r"^(?:DKFZp|FLJ|KIAA|LINC|LOC)\d+[A-Za-z0-9\-]*$")
+
+_ANNOTATION_CACHE: dict[str, dict] = {}
+_ANNOTATION_CACHE_ORDER: list[str] = []
+_ANNOTATION_CACHE_MAX = 8
+_ANNOTATION_TIMEOUT = 180
+
+
+def _normalize_species(value) -> str:
+    """把人类/小鼠等物种写法统一成小写键；无法识别返回 unknown。"""
+    text = str(value or "").strip().lower()
+    if not text:
+        return "unknown"
+    return _SPECIES_ALIASES.get(text, "unknown")
+
+
+def _classify_gene_id(value) -> str:
+    """单条标识符分类（顺序有意义：probe/Ensembl 先于 symbol 判断）。"""
+    text = str(value or "").strip().strip('"')
+    if not text:
+        return "unknown"
+    if _ENSEMBL_GENE_RE.match(text):
+        return "ensembl_gene"
+    if _ENSEMBL_TRANSCRIPT_RE.match(text):
+        return "ensembl_transcript"
+    if _REFSEQ_RE.match(text):
+        return "refseq"
+    if _ACCESSION_RE.match(text):
+        return "accession"
+    for pattern in _PROBE_RES:
+        if pattern.match(text):
+            return "probe_id"
+    if _ENTREZ_RE.match(text):
+        return "numeric"
+    if (_SYMBOL_UPPER_RE.match(text) or _SYMBOL_TITLE_RE.match(text)
+            or _SYMBOL_ORF_RE.match(text) or _SYMBOL_PREFIX_RE.match(text)):
+        return "symbol"
+    return "unknown"
+
+
+def _gene_id_type_counts(genes) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for gene in genes or []:
+        kind = _classify_gene_id(gene)
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def _dominant_id_type(counts: dict[str, int]) -> str:
+    """整体 ID 类型：只有一种可识别类型→该类型；多种→mixed；全未知→unknown。"""
+    recognized = {key: value for key, value in counts.items() if key != "unknown" and value}
+    if not recognized:
+        return "unknown"
+    if len(recognized) == 1:
+        return next(iter(recognized))
+    return "mixed"
+
+
+def _id_type_label(id_type: str) -> str:
+    return _ID_TYPE_LABELS.get(str(id_type), str(id_type))
+
+
+def _annotation_unavailable(reason: str, database=None, version: str = "",
+                            keytype: str = "") -> dict:
+    return {"available": False, "mapping": {}, "database": database,
+            "database_version": version or "", "keytype": keytype or "",
+            "one_to_many": 0, "many_to_one": 0, "reason": str(reason)}
+
+
+def _cache_annotation(digest: str, result: dict) -> None:
+    if digest not in _ANNOTATION_CACHE:
+        _ANNOTATION_CACHE_ORDER.append(digest)
+    _ANNOTATION_CACHE[digest] = result
+    while len(_ANNOTATION_CACHE_ORDER) > _ANNOTATION_CACHE_MAX:
+        oldest = _ANNOTATION_CACHE_ORDER.pop(0)
+        _ANNOTATION_CACHE.pop(oldest, None)
+
+
+def _r_map_gene_ids(genes, species: str = "human", id_type: str = "symbol") -> dict:
+    """调用 R / AnnotationDbi 做 ID→SYMBOL 映射（只读，不下载任何东西）。
+
+    返回 {available, mapping, database, database_version, keytype, one_to_many,
+    many_to_one, reason}；R / 注释包不可用时 available=False，由调用方退化成报告。
+    """
+    gene_list = [str(item).strip() for item in (genes or []) if str(item).strip()]
+    keytype = _ID_TYPE_KEYTYPES.get(str(id_type))
+    if not gene_list:
+        return _annotation_unavailable("没有需要映射的基因 ID", keytype=keytype or "")
+    if not keytype:
+        return _annotation_unavailable(f"不支持的标识符类型：{id_type}")
+    species_norm = _normalize_species(species)
+    if species_norm not in ("human", "mouse"):
+        return _annotation_unavailable(
+            f"物种 {species!r} 没有内置注释库（只支持 human / mouse）", keytype=keytype)
+    rscript = _rscript()
+    if not rscript:
+        return _annotation_unavailable("本机没有找到 Rscript，无法执行 ID→gene symbol 映射",
+                                       keytype=keytype)
+    script = _bg_io_r_script()
+    if not script.exists():
+        return _annotation_unavailable(f"缺少 R 桥脚本：{script}", keytype=keytype)
+    digest = hashlib.sha1(
+        ("\n".join([species_norm, keytype] + gene_list)).encode("utf-8", "replace")
+    ).hexdigest()
+    cached = _ANNOTATION_CACHE.get(digest)
+    if cached is not None:
+        return cached
+    work = Path(tempfile.mkdtemp(prefix="bg-annot-", dir=str(tempfile.gettempdir())))
+    try:
+        genes_path = work / "genes.txt"
+        genes_path.write_text("\n".join(gene_list), encoding="utf-8")
+        command = [rscript, "--vanilla", str(script), "--annotate",
+                   "--genes", str(genes_path), "--out", str(work),
+                   "--species", species_norm, "--keytype", keytype]
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True,
+                                       timeout=_ANNOTATION_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return _annotation_unavailable(f"R 注释超时（>{_ANNOTATION_TIMEOUT} 秒）",
+                                           keytype=keytype)
+        except Exception as error:  # noqa: BLE001
+            return _annotation_unavailable(f"无法调用 Rscript：{error}", keytype=keytype)
+        meta = _read_meta_tsv(work / "meta.tsv")
+        status = str(meta.get("status") or "error")
+        if status != "ok":
+            detail = (meta.get("error") or "").strip() or (completed.stderr or "")[-800:] \
+                     or f"R 注释退出码 {completed.returncode}"
+            result = _annotation_unavailable(detail, database=meta.get("database") or None,
+                                             version=str(meta.get("database_version") or ""),
+                                             keytype=str(meta.get("keytype") or keytype))
+            _cache_annotation(digest, result)
+            return result
+        mapping: dict[str, str] = {}
+        annotation_path = work / "annotation.tsv"
+        if annotation_path.exists():
+            try:
+                frame = pd.read_csv(annotation_path, sep="\t", dtype=str, keep_default_na=False)
+                for _, row in frame.iterrows():
+                    symbol = str(row.get("symbol", "") or "").strip()
+                    if symbol and symbol.lower() not in ("na", "nan", "none"):
+                        mapping[str(row.get("input_id", "")).strip()] = symbol
+            except Exception:  # noqa: BLE001 - 映射表坏掉就退化为 0 覆盖
+                mapping = {}
+        result = {
+            "available": True,
+            "mapping": mapping,
+            "database": meta.get("database") or None,
+            "database_version": str(meta.get("database_version") or ""),
+            "keytype": str(meta.get("keytype") or keytype),
+            "one_to_many": _to_int(meta.get("one_to_many")) or 0,
+            "many_to_one": _to_int(meta.get("many_to_one")) or 0,
+            "reason": "",
+        }
+        _cache_annotation(digest, result)
+        return result
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def gene_annotation_report(genes, *, species=None, inferred_species=None,
+                           platform_species=None, id_type=None, mapper=None,
+                           missing_values=None, include_mapping: bool = False) -> dict:
+    """基因标识符 → symbol 的映射报告（不猜映射，拿不到注释库就退化）。
+
+    species：用户确认的物种（human/mouse/auto）；inferred_species：从标识符推断的物种；
+    platform_species：GEO !Sample_organism_ch1 / 平台元数据里的物种；mapper：可注入的映射器
+    （默认 _r_map_gene_ids）。返回字段见模块说明与 test/py_geo_io_regression_test.py。
+    """
+    gene_list = [str(item).strip().strip('"') for item in (genes or [])]
+    counts = _gene_id_type_counts(gene_list)
+    resolved_type = str(id_type or _dominant_id_type(counts))
+    n_genes = len(gene_list)
+    inferred = _normalize_species(inferred_species) if inferred_species is not None \
+        else _normalize_species(_infer_species(gene_list))
+    requested = _normalize_species(species) if species is not None else "unknown"
+    if str(species or "").strip().lower() in ("", "auto"):
+        requested = "unknown"
+    platform = _normalize_species(platform_species) if platform_species else "unknown"
+    if requested != "unknown":
+        confirmed, source = requested, "user"
+    elif platform != "unknown":
+        confirmed, source = platform, "platform"
+    elif inferred != "unknown":
+        confirmed, source = inferred, "inferred"
+    else:
+        confirmed, source = "unknown", "unknown"
+
+    warnings: list[str] = []
+    consistent = None
+    if confirmed != "unknown":
+        consistent = True
+        for label, other in (("用户指定", requested), ("平台元数据", platform),
+                             ("标识符推断", inferred)):
+            if other != "unknown" and other != confirmed:
+                consistent = False
+                warnings.append(f"{label}物种 {other} 与确认物种 {confirmed} 不一致，"
+                                f"请核对数据来源与平台注释")
+
+    probe_count = int(counts.get("probe_id", 0))
+    mappable_counts = {key: value for key, value in counts.items() if key in _ID_TYPE_KEYTYPES}
+    mapping: dict[str, str] = {}
+    mapping_available = False
+    database = None
+    database_version = ""
+    keytype = ""
+    one_to_many = 0
+    many_to_one = 0
+    mapping_note = ""
+
+    total_mappable = sum(mappable_counts.values())
+    dominant_type = ""
+    dominant_ratio = 0.0
+    if total_mappable:
+        dominant_type = max(mappable_counts, key=lambda key: mappable_counts[key])
+        dominant_ratio = mappable_counts[dominant_type] / total_mappable
+    has_dominant_type = dominant_ratio >= 0.9
+
+    if not mappable_counts:
+        mapping_note = (f"未检测到可映射的 ID 类型（{_id_type_label(resolved_type)}）；"
+                        f"本机没有 GPL/平台注释表，不做猜测映射")
+        warnings.append("未执行 ID→gene symbol 映射：没有可映射的标识符类型")
+    elif len(mappable_counts) > 1 and not has_dominant_type:
+        mapping_note = ("同时存在多种可映射 ID 类型（" + "、".join(
+            f"{key}×{value}" for key, value in sorted(mappable_counts.items())) +
+            "）且没有占比 ≥90% 的主导类型，未自动猜测 keytype；"
+            "请先统一为一种标识符或指定 id_type")
+        warnings.append("混合多种可映射 ID 类型且没有主导类型，未执行 ID→gene symbol 映射")
+    elif confirmed not in ("human", "mouse"):
+        if confirmed == "unknown":
+            mapping_note = ("物种未确认，未执行 ID→gene symbol 映射；"
+                            "内置注释库只支持 human / mouse")
+            warnings.append("物种未确认，未执行 ID→gene symbol 映射")
+        else:
+            mapping_note = (f"物种 {confirmed} 没有内置注释库（只支持 human / mouse），"
+                            f"未执行 ID→gene symbol 映射")
+            warnings.append(f"物种 {confirmed} 不支持 ID→gene symbol 映射（只支持 human / mouse）")
+    else:
+        mappable_type = dominant_type
+        mappable_genes = [gene for gene in gene_list
+                          if _classify_gene_id(gene) == mappable_type]
+        mapper_func = mapper or _r_map_gene_ids
+        try:
+            raw = mapper_func(mappable_genes, species=confirmed, id_type=mappable_type)
+        except Exception as error:  # noqa: BLE001 - 注释失败退化为报告
+            raw = {"available": False, "reason": f"ID→symbol 映射失败：{error}"}
+        raw = raw or {}
+        database = raw.get("database") or None
+        database_version = str(raw.get("database_version") or "")
+        keytype = str(raw.get("keytype") or "")
+        if raw.get("available"):
+            mapping_available = True
+            for source_id, symbol in (raw.get("mapping") or {}).items():
+                text = str(symbol or "").strip()
+                if text and text.lower() not in ("na", "nan", "none"):
+                    mapping[str(source_id)] = text
+            one_to_many = int(raw.get("one_to_many") or 0)
+            many_to_one = int(raw.get("many_to_one") or 0)
+            mapping_note = (f"使用 {database or '注释库'}"
+                            f"{('（版本 ' + database_version + '）') if database_version else ''}"
+                            f" 的 {keytype or mappable_type} → SYMBOL 映射："
+                            f"成功 {len(mapping)}/{n_genes}")
+            if probe_count:
+                mapping_note += f"；另有 {probe_count} 个 probe ID 需要 GPL 注释表，未做猜测"
+            other_types = {key: value for key, value in mappable_counts.items()
+                           if key != mappable_type and value}
+            if other_types and len(mappable_counts) > 1:
+                mapping_note += ("；按占比 ≥90% 的主导类型映射，其他可映射类型未参与（"
+                                 + "、".join(f"{key}×{value}"
+                                            for key, value in sorted(other_types.items())) + "）")
+        else:
+            reason = str(raw.get("reason") or "注释库不可用")
+            mapping_note = f"未执行 ID→gene symbol 映射：{reason}"
+            warnings.append(f"ID→gene symbol 映射不可用：{reason}")
+
+    n_mapped = len(mapping)
+    unmapped = [gene for gene in gene_list if gene not in mapping]
+    coverage = round(n_mapped / n_genes, 4) if n_genes else 0.0
+    if n_mapped and unmapped:
+        warnings.append(f"{n_mapped}/{n_genes} 个 ID 映射到 gene symbol，"
+                        f"{len(unmapped)} 个未映射（示例："
+                        + "、".join(unmapped[:5]) + "）")
+    if probe_count and not mapping_available:
+        warnings.append(f"检测到 {probe_count} 个芯片 probe ID，需要 GPL 平台注释表才能"
+                        f"映射到 gene symbol（未猜测）")
+    if confirmed == "unknown" and probe_count:
+        warnings.append("检测到芯片 probe ID 且物种未确认：请先用 "
+                        "!Sample_organism_ch1 或平台信息确认物种")
+
+    missing = missing_values if isinstance(missing_values, dict) else {}
+    raw_missing = missing.get("n_missing")
+    try:
+        n_missing = int(raw_missing) if raw_missing is not None else None
+    except (TypeError, ValueError):
+        n_missing = None
+    if n_missing is None:
+        zero_imputation = {
+            "n_missing": None, "imputed_value": None,
+            "note": "读取器未提供缺失值数量；若读取阶段把缺失/未知值填成 0，"
+                    "0 只是占位符，不代表真实零表达",
+        }
+    elif n_missing > 0:
+        # 具体「0 填充」warning 由读取器（_finalize_matrix / _parse_geo_series）给出，
+        # 这里只把数量与语义记进报告，避免重复告警。
+        zero_imputation = {
+            "n_missing": n_missing, "imputed_value": 0.0,
+            "note": f"{n_missing} 个缺失/非数值表达值按 0 填充；0 只是占位符，不代表真实零表达",
+        }
+    else:
+        zero_imputation = {"n_missing": 0, "imputed_value": None,
+                           "note": "没有检测到需要按 0 填充的缺失值"}
+
+    rules = {
+        "one_to_many": "一个输入 ID 对应多个 symbol 时取 AnnotationDbi multiVals='first' "
+                       f"的第一个（本次 {one_to_many} 个）",
+        "many_to_one": "多个输入 ID 映射到同一 symbol 时全部保留、不丢弃"
+                       f"（本次折叠 {many_to_one} 个重复）",
+        "unmapped": "映射不到的 ID 保留原始标识符；后续基于 gene symbol 的富集/免疫/"
+                    "单细胞匹配会跳过它们，不按 0 表达处理",
+        "probe": "芯片 probe ID 需要 GPL 平台注释表；本机没有对应 GPL 表时只报 ID 类型与"
+                 "覆盖率，不做猜测映射",
+    }
+    report = {
+        "id_type": resolved_type,
+        "id_type_label": _id_type_label(resolved_type),
+        "id_type_counts": dict(sorted(counts.items())),
+        "dominant_id_type": dominant_type or None,
+        "species": confirmed,
+        "species_source": source,
+        "species_consistent": consistent,
+        "inferred_species": inferred,
+        "platform_species": platform,
+        "database": database,
+        "database_version": database_version or None,
+        "database_keytype": keytype or None,
+        "mapping_available": bool(mapping_available),
+        "mapping_note": mapping_note,
+        "n_genes": n_genes,
+        "n_recognized": n_genes - int(counts.get("unknown", 0)),
+        "n_mapped": n_mapped,
+        "n_unknown": n_genes - n_mapped,
+        "coverage": coverage,
+        "rules": rules,
+        "one_to_many": one_to_many,
+        "many_to_one": many_to_one,
+        "mapped_examples": dict(list(mapping.items())[:5]),
+        "unknown_examples": unmapped[:10],
+        "zero_imputation": zero_imputation,
+        "warnings": warnings,
+    }
+    if include_mapping:
+        report["mapping"] = dict(mapping)
+    return report
+
+
+def annotation_intersection(genes, reference, *, species=None, inferred_species=None,
+                            platform_species=None, id_type=None, mapper=None) -> dict:
+    """进入富集/免疫/单细胞匹配前的交集检查：ID 类型、交集基因数、覆盖率。"""
+    report = gene_annotation_report(
+        genes, species=species, inferred_species=inferred_species,
+        platform_species=platform_species, id_type=id_type, mapper=mapper,
+        include_mapping=True,
+    )
+    gene_list = [str(item).strip() for item in (genes or [])]
+    reference_set = {str(item).strip() for item in (reference or []) if str(item).strip()}
+    mapping = dict(report.get("mapping") or {})
+    used_identity = False
+    if not mapping and not report.get("mapping_available") and report.get("id_type") == "symbol":
+        mapping = {gene: gene for gene in gene_list}
+        used_identity = True
+    mapped_symbols = set(mapping.values())
+    n_mapped = len(mapping)
+    n_intersection = len(mapped_symbols & reference_set)
+    if used_identity:
+        note = "未执行 ID 映射，按原始 gene symbol 直接与参考基因集比较"
+    elif mapping:
+        note = f"使用 {report.get('database') or '注释库'} 映射后与参考基因集比较"
+    else:
+        note = "没有可映射的 gene symbol，无法可靠计算交集（不猜测）"
+    return {
+        "id_type": report.get("id_type"),
+        "id_type_label": report.get("id_type_label"),
+        "species": report.get("species"),
+        "database": report.get("database"),
+        "mapping_available": report.get("mapping_available"),
+        "n_input": int(report.get("n_genes") or 0),
+        "n_mapped": n_mapped,
+        "coverage": report.get("coverage"),
+        "reference_size": len(reference_set),
+        "n_intersection": n_intersection,
+        "intersection_coverage": round(n_intersection / n_mapped, 4) if n_mapped else 0.0,
+        "reference_coverage": (round(n_intersection / len(reference_set), 4)
+                               if reference_set else 0.0),
+        "intersection_examples": sorted(mapped_symbols & reference_set)[:10],
+        "unknown_examples": report.get("unknown_examples") or [],
+        "note": note,
+    }
+
+
 def _detect_value_kind(X) -> tuple[str, bool, str]:
     """表达值类型判定 → (value_kind, has_counts, 说明)。"""
     arr = np.asarray(X)
@@ -391,8 +838,9 @@ def _align_sample_info(sample_info, samples) -> pd.DataFrame:
     return out
 
 
-def _payload(fmt: str, source, X, genes, samples, sample_info=None, notes=None, warnings=None, meta=None) -> dict:
-    """构造 §7.1 的统一导入结果。"""
+def _payload(fmt: str, source, X, genes, samples, sample_info=None, notes=None, warnings=None,
+             meta=None, options=None, annotate: bool = True) -> dict:
+    """构造 §7.1 的统一导入结果（含基因标识符/物种确认报告）。"""
     if X is None:
         matrix = None
         n_samples, n_genes = 0, 0
@@ -420,8 +868,45 @@ def _payload(fmt: str, source, X, genes, samples, sample_info=None, notes=None, 
     for key, value in (meta or {}).items():
         out_meta[key] = value
     out_notes = list(notes or [])
+    out_warnings = [str(item) for item in (warnings or [])]
     if kind_note:
         out_notes.append(kind_note)
+
+    annotation = None
+    if annotate and matrix is not None and str(fmt) in _GENE_MATRIX_FORMATS and genes:
+        requested_species = None
+        if isinstance(options, dict):
+            requested = str(options.get("species") or "").strip()
+            if requested and requested.lower() not in ("auto", "unknown"):
+                requested_species = requested
+        platform_species = None
+        if isinstance(meta, dict):
+            platform_species = meta.get("platform_species")
+        annotation = gene_annotation_report(
+            genes,
+            species=requested_species,
+            inferred_species=species,
+            platform_species=platform_species,
+            missing_values=out_meta.get("missing_values"),
+        )
+        out_meta["gene_annotation"] = annotation
+        confirmed = str(annotation.get("species") or "unknown")
+        if confirmed != "unknown":
+            if species == "unknown" or requested_species:
+                out_meta["species"] = confirmed
+            out_meta["species_source"] = annotation.get("species_source")
+        id_label = str(annotation.get("id_type_label") or "")
+        coverage = float(annotation.get("coverage") or 0.0)
+        out_notes.append(
+            f"基因标识符：{id_label}；物种 {annotation.get('species')}"
+            f"（{annotation.get('species_source')}）；"
+            f"ID→symbol 映射覆盖率 {coverage:.1%}"
+            f"（{annotation.get('n_mapped')}/{annotation.get('n_genes')}）"
+        )
+        if annotation.get("mapping_note"):
+            out_notes.append(str(annotation["mapping_note"]))
+        out_warnings.extend(str(item) for item in (annotation.get("warnings") or []))
+
     return {
         "format": str(fmt),
         "name": Path(urllib.parse.urlparse(str(source)).path or str(source)).name or str(source),
@@ -431,7 +916,8 @@ def _payload(fmt: str, source, X, genes, samples, sample_info=None, notes=None, 
         "sample_info": _align_sample_info(sample_info, samples) if matrix is not None else (
             sample_info if isinstance(sample_info, pd.DataFrame) else pd.DataFrame()),
         "notes": [str(item) for item in out_notes],
-        "warnings": [str(item) for item in (warnings or [])],
+        "warnings": out_warnings,
+        "gene_annotation": annotation,
         "meta": out_meta,
     }
 
@@ -641,12 +1127,13 @@ def _finalize_matrix(frame: pd.DataFrame, fmt: str, source, options, notes, warn
     if numeric.empty or numeric.shape[0] == 0 or numeric.shape[1] == 0:
         raise _err("bad_request", f"矩阵里没有可解析的数值：{Path(str(source)).name}")
     if nan_before > 0:
-        warnings.append(f"有 {nan_before} 个非数值/缺失单元格（{nan_before / total_cells:.2%}）已按 0 填充")
+        warnings.append(f"有 {nan_before} 个非数值/缺失单元格（{nan_before / total_cells:.2%}）"
+                        f"已按 0 填充；0 是占位符，不代表真实零表达")
     if drop_rows:
         warnings.append(f"丢弃 {drop_rows} 个全空/全非数值行")
     if drop_cols:
         warnings.append(f"丢弃 {drop_cols} 个全空/全非数值列")
-    # 少量 NaN 用 0 填充（GEO 常见）
+    # 少量 NaN 用 0 填充（GEO 常见）；数量记入 meta，供基因注释报告区分「未知」与「真实零」
     numeric = numeric.fillna(0.0)
 
     row_labels = [str(item) for item in numeric.index]
@@ -664,12 +1151,13 @@ def _finalize_matrix(frame: pd.DataFrame, fmt: str, source, options, notes, warn
     else:
         genes, samples = col_labels, row_labels
     return _payload(fmt, source, values, genes, samples, sample_info=sample_info,
-                    notes=notes, warnings=warnings,
-                    meta={"orientation": "genes_by_samples" if transpose else "samples_by_genes"})
+                    notes=notes, warnings=warnings, options=options,
+                    meta={"orientation": "genes_by_samples" if transpose else "samples_by_genes",
+                          "missing_values": {"n_missing": nan_before, "imputed_value": 0.0}})
 
 
-def _parse_geo_series(path, source) -> dict:
-    """解析 GEO series matrix：table 段 → X，!Sample_* → sample_info。"""
+def _parse_geo_series(path, source, options=None) -> dict:
+    """解析 GEO series matrix：table 段 → X，!Sample_* → sample_info（含平台物种）。"""
     sample_lines: list[str] = []
     header_cells: list[str] | None = None
     rows: list[list[str]] = []
@@ -727,8 +1215,10 @@ def _parse_geo_series(path, source) -> dict:
         warnings.append(f"丢弃 {int((~keep).sum())} 个 ID 为空的行")
     if np.isnan(values).all():
         raise _err("bad_request", f"GEO series matrix 表格里没有可解析的数值：{Path(path).name}")
-    if np.isnan(values).any():
-        warnings.append("表格里有缺失/非数值（NA 等）按 0 填充")
+    n_missing = int(np.isnan(values).sum())
+    if n_missing:
+        warnings.append(f"表格里有 {n_missing} 个缺失/非数值（NA 等）按 0 填充；"
+                        f"0 是占位符，不代表真实零表达")
     values = np.nan_to_num(values, nan=0.0)
 
     # ---- 解析 !Sample_* 元数据 ----
@@ -801,6 +1291,20 @@ def _parse_geo_series(path, source) -> dict:
             info_data.setdefault("title", titles)
         else:
             warnings.append("!Sample_title 有重复，样本名改用矩阵表头")
+    platform_species = "unknown"
+    for key, vals in entries:
+        if not str(key).startswith("organism"):
+            continue
+        for value in vals:
+            candidate = _normalize_species(value)
+            if candidate != "unknown":
+                platform_species = candidate
+                break
+        if platform_species != "unknown":
+            break
+    if platform_species != "unknown":
+        notes.append(f"平台物种：{platform_species}（来自 !Sample_organism_ch1）")
+
     sample_info = pd.DataFrame(index=pd.Index(info_index, name="sample"))
     for column, vals in info_data.items():
         if len(vals) == len(samples):
@@ -811,8 +1315,10 @@ def _parse_geo_series(path, source) -> dict:
             sample_info[column] = vals + [""] * (len(samples) - len(vals))
     notes.append("样本名取自 series matrix 表头（通常 = GEO accession），!Sample_title 保留在 title 列")
     payload = _payload("geo_series", source, values.T, genes_raw, samples, sample_info=sample_info,
-                       notes=notes, warnings=warnings,
-                       meta={"series": {"n_samples": len(samples), "n_genes": len(genes_raw)}})
+                       notes=notes, warnings=warnings, options=options,
+                       meta={"series": {"n_samples": len(samples), "n_genes": len(genes_raw)},
+                             "platform_species": platform_species,
+                             "missing_values": {"n_missing": n_missing, "imputed_value": 0.0}})
     return payload
 
 
@@ -822,7 +1328,7 @@ def _load_text(path, options) -> dict:
     if not head.strip():
         raise _err("bad_request", f"文件是空的：{Path(path).name}")
     if "!series_matrix_table_begin" in head:
-        return _parse_geo_series(path, path)
+        return _parse_geo_series(path, path, options)
     notes: list[str] = []
     warnings: list[str] = []
     frame = _frame_from_text(path, options, notes, warnings)
@@ -1205,7 +1711,7 @@ def _load_r(path, dirs, options) -> dict:
             sample_info = None
     fmt = "rdata" if Path(path).name.lower().endswith((".rdata", ".rda")) else "rds"
     payload = _payload(fmt, path, matrix, genes, samples, sample_info=sample_info,
-                       notes=notes, warnings=warnings,
+                       notes=notes, warnings=warnings, options=options,
                        meta={"r_class": r_class, "orientation": orientation,
                              "image": str(matrix_path)})
     if meta.get("has_counts") and str(meta["has_counts"]).upper() == "TRUE":
@@ -1843,6 +2349,16 @@ def _resolve_source(source, dirs, options, inspect=False) -> tuple[Path, list[st
 # ---------------------------------------------------------------------------
 
 
+def _inspect_id_warnings(id_type: str, counts: dict, warnings: list) -> None:
+    """inspect 阶段就提示 ID 类型风险（probe 需要 GPL 表 / 无法识别时不猜测映射）。"""
+    probe_count = int(counts.get("probe_id", 0) or 0)
+    if id_type == "probe_id" or probe_count:
+        warnings.append("检测到芯片 probe ID：需要 GPL 平台注释表才能映射到 gene symbol"
+                        "（导入后仍会给出映射报告，不做猜测映射）")
+    elif id_type == "unknown":
+        warnings.append("基因标识符类型无法识别：导入后不会猜测 ID→symbol 映射")
+
+
 def _inspect_text(path: Path, options) -> dict:
     options = options or {}
     notes = []
@@ -1855,6 +2371,7 @@ def _inspect_text(path: Path, options) -> dict:
         n_samples = n_genes = 0
         header_seen = False
         in_table = False
+        id_labels: list[str] = []
         try:
             with _open_text(path) as handle:
                 for line in handle:
@@ -1871,11 +2388,17 @@ def _inspect_text(path: Path, options) -> dict:
                             header_seen = True
                         elif any(cell.strip() for cell in cells):
                             n_genes += 1
+                            if len(id_labels) < 100:
+                                id_labels.append(cells[0])
         except Exception:  # noqa: BLE001
             pass
+        counts = _gene_id_type_counts(id_labels)
+        id_type = _dominant_id_type(counts)
+        _inspect_id_warnings(id_type, counts, warnings)
         notes.append("GEO series matrix（含 !series_matrix_table_begin）")
         notes.append("inspect 仅流式计数行列，未构建矩阵")
         return {"format": "geo_series", "n_samples": n_samples, "n_genes": n_genes,
+                "gene_id_type": id_type, "gene_id_type_label": _id_type_label(id_type),
                 "size": size, "notes": notes, "warnings": warnings, "candidates": None}
     delimiter = options.get("delimiter") or _sniff_delimiter(head.splitlines())
     lines = head.splitlines()
@@ -1940,9 +2463,14 @@ def _inspect_text(path: Path, options) -> dict:
     if values:
         arr = np.asarray(values, dtype=np.float64)
         value_kind, _, _ = _detect_value_kind(arr.reshape(1, -1))
+    id_labels = row_labels if (has_index and row_labels) else col_labels
+    counts = _gene_id_type_counts(id_labels)
+    id_type = _dominant_id_type(counts)
+    _inspect_id_warnings(id_type, counts, warnings)
     notes.append("分隔符：%s" % ("TAB" if delimiter == "\t" else ("空白" if delimiter == "whitespace" else delimiter)))
     notes.append("inspect 仅读文件头并流式计数行数，未加载整表")
     return {"format": "matrix_text", "n_samples": int(n_samples), "n_genes": int(n_genes),
+            "gene_id_type": id_type, "gene_id_type_label": _id_type_label(id_type),
             "value_kind": value_kind, "size": size, "delimiter": delimiter,
             "notes": notes, "warnings": warnings, "candidates": None}
 
@@ -2203,10 +2731,11 @@ def load_source(source, workdir=None, options=None, progress=None, **opts) -> di
     result["name"] = str(merged.get("name") or (Path(result.get("name") or path.name).stem if path.name else path.name))
     result["notes"] = list(resolve_notes) + list(result.get("notes") or [])
     warnings = list(result.get("warnings") or [])
-    if merged.get("species"):
-        species = str(merged["species"])
-        if species in ("human", "mouse", "unknown"):
+    if merged.get("species") and str(merged["species"]).strip().lower() not in ("auto", ""):
+        species = _normalize_species(merged["species"])
+        if species != "unknown":
             result["meta"]["species"] = species
+            result["meta"].setdefault("species_source", "user")
     # 附加样本信息表 / 临床表 join
     for key, label in (("sample_sheet", "样本信息"), ("clinical", "临床")):
         extra_path = merged.get(key)
